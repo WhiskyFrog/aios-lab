@@ -107,6 +107,39 @@ Implementer session executes with your local permissions — assign it only
 to repositories you trust it to edit, and raise `--timeout-ms` (Sprint 0
 default 300000) for real implementation work.
 
+## Human Approver Worker
+
+`workers/human-approver.mjs` binds the `approver` Role to a human operator
+instead of a session. It follows the command Worker contract: Task document
+on stdin, `AIOS_ROLE`/`AIOS_TASK_ID` in the environment, one
+`aios.result/v1` object on stdout.
+
+```json
+{
+  "schema": "aios.assignments/v1",
+  "assignments": {
+    "approver": ["node", "workers/human-approver.mjs"]
+  }
+}
+```
+
+Decision file protocol: the worker reads
+`.aios/approvals/<task-id>` (relative to the repository root) and never
+writes to it — only the operator does. The file's content, with
+surrounding whitespace ignored, must be exactly `approved` or `rejected`;
+anything else yields a `status: failure` Result quoting the invalid
+content.
+
+Halt-then-resume flow for a Task with `approval: required`: once a Task
+reaches its approval gate, run the engine as usual. Before the file exists,
+the worker returns a `status: failure` Result whose reason names the exact
+path to create and the two accepted contents, so the run halts for
+operator recovery without an engine-authored Task transition or retry.
+The operator inspects the Task and repository, writes `approved` or
+`rejected` to `.aios/approvals/<task-id>`, and reruns
+`aios run <task-id> --assignments ...` — the engine re-invokes the
+approver Worker, which now reads the decision and lets the loop continue.
+
 ## Attempt Frames
 
 The engine wraps every Attempt it appends to a Task in an HTML-comment frame
