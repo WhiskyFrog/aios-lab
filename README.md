@@ -70,6 +70,43 @@ during execution halts the run without an engine-authored Task transition or
 retry increment. External Worker changes elsewhere in the repository are not
 rolled back; an operator must inspect them before explicitly resuming.
 
+## Claude Code Workers
+
+`workers/claude-worker.mjs` binds a Role to one non-interactive Claude Code
+session. It follows the command Worker contract: Task document on stdin,
+`AIOS_ROLE`/`AIOS_TASK_ID` in the environment, one `aios.result/v1` object
+on stdout. The session's JSON-only reply becomes the Result payload; a
+reply of `{"failure_reason": "..."}` becomes a `status: failure` Result,
+and anything unusable exits nonzero so the engine halts without a Task
+transition.
+
+```json
+{
+  "schema": "aios.assignments/v1",
+  "assignments": {
+    "implementer": ["node", "workers/claude-worker.mjs", "C:\\path\\to\\claude.exe"],
+    "reviewer": ["node", "workers/claude-worker.mjs", "C:\\path\\to\\claude.exe"]
+  }
+}
+```
+
+The trailing argument (or `AIOS_CLAUDE_CLI`) names the Claude executable —
+required on Windows when `claude` resolves to a `.ps1`/`.cmd` shim, because
+Workers are spawned without a shell. `AIOS_CLAUDE_MODEL` overrides the
+model alias (default `sonnet`).
+
+Permission model: the Implementer session runs with `acceptEdits` and Bash
+allowed — it is the one Role meant to change the repository. Reviewer and
+Approver sessions keep the default non-interactive permissions, where only
+read-only tools plus `npm test` work. Prompts additionally forbid every
+session from touching `.aios/` or git history; the engine's conflict
+detection halts the run if a Worker modifies the active Task anyway.
+
+Caveats: each Role action starts a fresh session that bills usage, and an
+Implementer session executes with your local permissions — assign it only
+to repositories you trust it to edit, and raise `--timeout-ms` (Sprint 0
+default 300000) for real implementation work.
+
 ## Attempt Frames
 
 The engine wraps every Attempt it appends to a Task in an HTML-comment frame

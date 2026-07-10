@@ -1,0 +1,15 @@
+{
+  "schema": "aios.assignments/v1",
+  "assignments": {
+    "implementer": [
+      "node",
+      "workers/claude-worker.mjs",
+      "C:\\DogFoot\\JS\\NODE\\node_modules\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe"
+    ],
+    "reviewer": [
+      "node",
+      "workers/claude-worker.mjs",
+      "C:\\DogFoot\\JS\\NODE\\node_modules\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe"
+    ]
+  }
+}
