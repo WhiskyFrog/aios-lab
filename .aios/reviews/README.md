@@ -65,9 +65,38 @@ recorded; they never alter the verdict.
 
 ## Immutability
 
-A persisted Review is never edited, renamed, or deleted. A wrong verdict is
-corrected by the loop itself: the next evaluation produces the next Review.
-At most one Review exists per `(task, attempt)` pair.
+A persisted Review is never edited, renamed, or deleted, and at most one
+Review exists per `(task, attempt)` pair. A persisted verdict is therefore
+never corrected, in place or by re-evaluation. A mistaken
+`changes_requested` is absorbed by the loop: it costs one retry, and the
+next Attempt receives its own Review. A mistaken `pass` moves the Task
+toward a terminal state; recovering from it is an operator decision outside
+this workflow, exactly like reopening a `done` or `blocked` Task under
+`aios.task/v1`.
+
+## Orphan Recovery
+
+`aios.task/v1` requires the engine to persist a Review before atomically
+rewriting the Task that references it. A crash between those two writes
+leaves an orphan: a persisted Review that no Task transition references yet.
+
+Recovery is deterministic and happens before the Reviewer is ever invoked.
+When the engine takes up a Task in `state: review`, it must first scan
+`.aios/reviews/` for a Review whose `task` equals the Task's `id` and whose
+`attempt` equals `retry.count + 1`:
+
+- If exactly one exists, the evaluation already happened. The engine must
+  not re-invoke the Reviewer; it attaches the orphan by applying its pending
+  transition — `last_review` and the matching state, retry, and approval
+  mutations — from the persisted verdict.
+- If none exists, the engine invokes the Reviewer normally.
+- If more than one exists, the store violates the `(task, attempt)`
+  uniqueness rule. The engine halts the run for operator recovery; it must
+  not pick one, delete any, or consume a retry.
+
+This scan-before-invoke rule is also what enforces uniqueness going forward:
+a compliant engine cannot create a second Review for an attempt whose Review
+already exists.
 
 ## Activated Task Checks
 

@@ -45,33 +45,55 @@ allocates identifiers.
 
 ## Success Payloads
 
+Each Role's payload is defined by its field table. Every field is required
+and, for strings, non-empty; unknown fields are rejected. The snippets are
+valid JSON examples, not schemas.
+
 `implementer` — the engine appends these verbatim as the next Attempt's
 `Summary` and `Verification`, then sets `state: review`, in one atomic Task
 rewrite:
 
+| Field | Type | Rule |
+| --- | --- | --- |
+| `summary` | string | What was changed or produced. |
+| `verification` | string | What was checked, or `Not run: <reason>`. |
+
 ```json
-{ "summary": "<non-empty>", "verification": "<non-empty>" }
+{ "summary": "Defined the contract.", "verification": "Checked it against the lifecycle." }
 ```
 
 `reviewer` — the engine persists an `aios.review/v1` document carrying the
 next Review ID, this verdict, and `findings` as its body, then applies the
 matching Task transition per the `aios.task/v1` lifecycle:
 
+| Field | Type | Rule |
+| --- | --- | --- |
+| `verdict` | enum | One of `pass`, `changes_requested`. |
+| `findings` | string | Becomes the Review body. |
+
 ```json
-{ "verdict": "pass" | "changes_requested", "findings": "<non-empty>" }
+{ "verdict": "changes_requested", "findings": "The payload examples are not valid JSON." }
 ```
 
 `approver` — the engine sets `approval` and `state` per the `aios.task/v1`
 lifecycle:
 
+| Field | Type | Rule |
+| --- | --- | --- |
+| `decision` | enum | One of `approved`, `rejected`. |
+
 ```json
-{ "decision": "approved" | "rejected" }
+{ "decision": "approved" }
 ```
 
 ## Failure
 
+| Field | Type | Rule |
+| --- | --- | --- |
+| `reason` | string | Why the worker could not produce a usable outcome. |
+
 ```json
-{ "reason": "<non-empty>" }
+{ "reason": "The worker process exited before returning a Result." }
 ```
 
 A `failure` Result, a Result that fails validation, and a Result whose
