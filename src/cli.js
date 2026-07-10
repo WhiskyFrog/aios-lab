@@ -13,6 +13,8 @@ function usage() {
     "",
     "The command runs one Task through each assigned Role until it is done,",
     "blocked, or halted by an execution/configuration error.",
+    "",
+    "Exit codes: 0 done, 1 halted, 2 blocked, 64 usage error.",
   ].join("\n");
 }
 
@@ -61,7 +63,7 @@ export async function main(argv = process.argv.slice(2)) {
     options = parseArguments(argv);
   } catch (error) {
     console.error(error.message);
-    return 2;
+    return 64;
   }
   if (options.help) {
     console.log(usage());

@@ -36,6 +36,10 @@ export class TaskConflictError extends StoreError {
   }
 }
 
+function normalizeLineEndings(text) {
+  return text.replace(/\r\n?/g, "\n");
+}
+
 function parseYaml(text, label) {
   const document = parseDocument(text, {
     prettyErrors: true,
@@ -143,10 +147,14 @@ function framedAttemptNumbers(attempts) {
 }
 
 function attemptNumbers(body) {
-  const attempts = markdownSection(body, "Attempts");
-  if (!attempts) {
+  const section = markdownSection(body, "Attempts");
+  if (!section) {
     return [];
   }
+  // Frames locate content by offsets, so both measurement (appendAttempt)
+  // and parsing must operate on the same LF-normalized view regardless of
+  // how a checkout or editor materialized the document.
+  const attempts = normalizeLineEndings(section);
   const framed = framedAttemptNumbers(attempts);
   if (framed.firstFrame === -1) {
     return legacyAttemptNumbers(attempts);
@@ -222,8 +230,8 @@ export function appendAttempt(body, attempt, summary, verification) {
     throw new StoreError(`Attempt ${attempt} already exists in the Task`);
   }
 
-  const normalizedSummary = summary.trim();
-  const normalizedVerification = verification.trim();
+  const normalizedSummary = normalizeLineEndings(summary).trim();
+  const normalizedVerification = normalizeLineEndings(verification).trim();
   const attemptHeading = `### Attempt ${attempt}`;
   const frame = `<!-- aios:attempt-frame v1 number=${attempt} summary=${normalizedSummary.length} verification=${normalizedVerification.length} -->`;
 

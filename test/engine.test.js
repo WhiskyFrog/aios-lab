@@ -413,6 +413,41 @@ test("a Task mutation during Worker execution is preserved and halts projection"
   assert.doesNotMatch(stored, /### Attempt 1/);
 });
 
+test("a CRLF-materialized checkout keeps framed Attempts readable and finishes", async (t) => {
+  const { root, taskPath, store } = await createRepository(t);
+  const firstRun = await new LoopEngine({
+    root,
+    assignments: new TrackingResolver({
+      implementer: new ScriptedWorker(
+        result("implementer", {
+          summary: "Line one.\r\nLine two.",
+          verification: "Verified with CRLF payload endings.",
+        }),
+      ),
+    }),
+  }).run(TASK_ID);
+  assert.equal(firstRun.kind, "halted");
+  assert.match(firstRun.reason, /No Worker is assigned/);
+
+  const materialized = (await readFile(taskPath, "utf8")).replace(
+    /\r?\n/g,
+    "\r\n",
+  );
+  await writeFile(taskPath, materialized, "utf8");
+
+  const outcome = await new LoopEngine({
+    root,
+    assignments: new TrackingResolver({
+      reviewer: new ScriptedWorker(review("pass")),
+    }),
+  }).run(TASK_ID);
+
+  assert.equal(outcome.kind, "done");
+  const task = await loadValidated(store);
+  assert.equal(task.metadata.state, "done");
+  assert.match(task.body, /Line one\./);
+});
+
 test("strict Result validation rejects unknown fields without changing Task", async (t) => {
   const { root, taskPath } = await createRepository(t);
   const before = await readFile(taskPath, "utf8");

@@ -38,6 +38,10 @@ npm run aios -- run task-0003 --assignments .aios/assignments.json
 The Assignment file is re-read before every Role action. Replacing a command
 changes the Worker without changing the Task or Loop Engine.
 
+`aios run` exits with 0 when the Task reaches `done`, 2 when it reaches
+`blocked`, 1 when the run halts for operator recovery, and 64 for a usage
+error.
+
 Assignment commands are trusted local configuration and run with the current
 user's permissions. Do not execute an Assignment file from an untrusted
 repository.
@@ -65,6 +69,33 @@ A nonzero exit, timeout, malformed Result, missing Assignment, or Task change
 during execution halts the run without an engine-authored Task transition or
 retry increment. External Worker changes elsewhere in the repository are not
 rolled back; an operator must inspect them before explicitly resuming.
+
+## Attempt Frames
+
+The engine wraps every Attempt it appends to a Task in an HTML-comment frame
+that is invisible in rendered Markdown:
+
+```markdown
+<!-- aios:attempt-frame v1 number=1 summary=24 verification=31 -->
+### Attempt 1
+
+#### Summary
+
+...
+<!-- /aios:attempt-frame v1 number=1 -->
+```
+
+`summary` and `verification` are the lengths of the framed text in UTF-16
+code units (JavaScript string lengths), measured after normalizing line
+endings to LF. The engine locates Attempt content by these offsets instead
+of parsing prose, so Result text that merely looks like an Attempt heading
+cannot spoof the projection. Frames are load-bearing on read: do not
+hand-edit a framed Attempt. Attempts written before framing existed remain
+readable as long as they precede the first frame.
+
+Line endings: `.gitattributes` pins the repository to LF, and both frame
+measurement and parsing operate on an LF-normalized view, so a checkout or
+editor that materializes CRLF keeps framed Tasks readable.
 
 ## Limits
 

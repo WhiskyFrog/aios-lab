@@ -1,0 +1,4 @@
+# Attempt frames locate content by offsets measured over LF-normalized
+# text. Keep every text file LF so a fresh checkout matches the committed
+# bytes regardless of core.autocrlf.
+* text=auto eol=lf

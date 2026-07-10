@@ -46,6 +46,13 @@ function taskDocument() {
   return `---\n${stringify(metadata, { lineWidth: 0 }).trimEnd()}\n---\n${body}`;
 }
 
+test("a usage error exits with code 64, distinct from blocked", async () => {
+  await assert.rejects(
+    executeFile(process.execPath, [cli, "run"], { windowsHide: true }),
+    (error) => error.code === 64 && /Usage:/.test(error.stderr),
+  );
+});
+
 test("one CLI trigger runs command Implementer and Reviewer through done", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "aios-cli-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));

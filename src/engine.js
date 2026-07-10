@@ -79,11 +79,8 @@ export class LoopEngine {
         }
         if (currentReviews.length === 1) {
           const orphan = currentReviews[0];
-          if (
-            orphan.metadata.project !== task.metadata.project ||
-            orphan.metadata.task !== task.metadata.id
-          ) {
-            return halted(task, "Orphan Review does not match the active Task");
+          if (orphan.metadata.project !== task.metadata.project) {
+            return halted(task, "Orphan Review does not match the active Task's project");
           }
           try {
             await this.store.writeTask(
