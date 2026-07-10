@@ -1,0 +1,20 @@
+{
+  "name": "aios-lab",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.js",
+  "bin": {
+    "aios": "./src/cli.js"
+  },
+  "scripts": {
+    "aios": "node ./src/cli.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
+  }
+}
