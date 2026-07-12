@@ -9,6 +9,7 @@ import test from "node:test";
 import { stringify } from "yaml";
 
 import { collectDashboardData, renderDashboard, writeDashboard } from "../src/dashboard.js";
+import { SessionLedger } from "../src/sessions.js";
 
 const executeFile = promisify(execFile);
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -196,6 +197,55 @@ test("renderDashboard produces self-contained HTML with no external requests or 
   assert.doesNotMatch(html, /<script/i);
   assert.doesNotMatch(html, /https?:\/\//);
   assert.match(html, /A &lt;Task&gt; &amp; &quot;quoted&quot; title/);
+});
+
+test("dashboard renders per-session usage and refill telemetry", async (t) => {
+  const root = await makeRoot(t);
+  const ledger = new SessionLedger(
+    path.join(root, ".aios", "runtime", "sessions.json"),
+  );
+  await ledger.record({
+    id: "session-visible-1",
+    task: "task-0009",
+    role: "implementer",
+    model: "claude-sonnet",
+    started_at: "2026-07-12T01:00:00Z",
+    observed_at: "2026-07-12T01:02:00Z",
+    outcome: "capacity_deferred",
+    usage: {
+      input_tokens: 100,
+      output_tokens: 20,
+      cache_creation_input_tokens: 10,
+      cache_read_input_tokens: 30,
+    },
+    cost_usd: 0.0123,
+    capacity: {
+      status: "rejected",
+      utilization: 0.82,
+      resets_at: "2026-07-12T05:00:00Z",
+    },
+  });
+
+  const data = await collectDashboardData(root);
+  assert.equal(data.sessionError, null);
+  assert.equal(data.workerSessions.length, 1);
+  const html = renderDashboard(data);
+  assert.match(html, /Worker Sessions/);
+  assert.match(html, /session-visible-1/);
+  assert.match(html, /160 total/);
+  assert.match(html, /82%/);
+  assert.match(html, /2026-07-12T05:00:00\.000Z/);
+});
+
+test("dashboard shows an invalid session ledger as a visible error", async (t) => {
+  const root = await makeRoot(t);
+  const runtime = path.join(root, ".aios", "runtime");
+  await mkdir(runtime, { recursive: true });
+  await writeFile(path.join(runtime, "sessions.json"), "not-json", "utf8");
+
+  const data = await collectDashboardData(root);
+  assert.match(data.sessionError, /valid JSON/);
+  assert.match(renderDashboard(data), /Session ledger error/);
 });
 
 test("writeDashboard writes a file and returns its path", async (t) => {

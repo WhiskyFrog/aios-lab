@@ -11,18 +11,19 @@ function usage() {
   return [
     "Usage:",
     "  aios run <task-id> [--root <path>] [--assignments <path>] [--timeout-ms <n>]",
+    "       [--wait-for-capacity] [--max-capacity-wait-ms <n>] [--max-capacity-pauses <n>]",
     "  aios dashboard [--root <path>] [--out <file>]",
     "",
     "The run command runs one Task through each assigned Role until it is",
-    "done, blocked, or halted by an execution/configuration error.",
+    "done, blocked, waiting for Worker capacity, or halted by an error.",
     "",
     "The dashboard command generates a self-contained HTML overview of every",
     "Task's lifecycle position and evidence (default dashboard.html at the",
     "repository root); it is a read-only, one-shot pass and never modifies",
     "anything under .aios/.",
     "",
-    "Exit codes: run — 0 done, 1 halted, 2 blocked, 64 usage error.",
-    "            dashboard — 0 written, 64 usage error.",
+    "Exit codes: run: 0 done, 1 halted, 2 blocked, 64 usage error, 75 waiting.",
+    "            dashboard: 0 written, 64 usage error.",
   ].join("\n");
 }
 
@@ -37,9 +38,16 @@ function parseRunArguments(rest) {
     root: process.cwd(),
     assignments: null,
     timeoutMs: 300_000,
+    waitForCapacity: false,
+    maxCapacityWaitMs: 604_800_000,
+    maxCapacityPauses: 8,
   };
   for (let index = 1; index < rest.length; index += 1) {
     const flag = rest[index];
+    if (flag === "--wait-for-capacity") {
+      options.waitForCapacity = true;
+      continue;
+    }
     const value = rest[index + 1];
     if (!value) {
       throw new Error(`Missing value for ${flag}`);
@@ -52,6 +60,16 @@ function parseRunArguments(rest) {
       options.timeoutMs = Number(value);
       if (!Number.isInteger(options.timeoutMs) || options.timeoutMs <= 0) {
         throw new Error("--timeout-ms must be a positive integer");
+      }
+    } else if (flag === "--max-capacity-wait-ms") {
+      options.maxCapacityWaitMs = Number(value);
+      if (!Number.isInteger(options.maxCapacityWaitMs) || options.maxCapacityWaitMs <= 0) {
+        throw new Error("--max-capacity-wait-ms must be a positive integer");
+      }
+    } else if (flag === "--max-capacity-pauses") {
+      options.maxCapacityPauses = Number(value);
+      if (!Number.isInteger(options.maxCapacityPauses) || options.maxCapacityPauses <= 0) {
+        throw new Error("--max-capacity-pauses must be a positive integer");
       }
     } else {
       throw new Error(`Unknown option ${flag}`);
@@ -126,16 +144,41 @@ export async function main(argv = process.argv.slice(2)) {
     timeoutMs: options.timeoutMs,
   });
   const engine = new LoopEngine({ root: options.root, assignments });
-  const outcome = await engine.run(options.taskId);
-  console.log(
-    JSON.stringify({
-      kind: outcome.kind,
-      task: outcome.task?.metadata.id ?? options.taskId,
-      state: outcome.task?.metadata.state ?? null,
-      reason: outcome.reason ?? null,
-    }),
-  );
-  return outcome.kind === "done" ? 0 : outcome.kind === "blocked" ? 2 : 1;
+  const controller = new AbortController();
+  const cancel = () => controller.abort();
+  if (options.waitForCapacity) {
+    process.once("SIGINT", cancel);
+    process.once("SIGTERM", cancel);
+  }
+  let outcome;
+  try {
+    outcome = await engine.run(options.taskId, {
+      waitForCapacity: options.waitForCapacity,
+      maxCapacityWaitMs: options.maxCapacityWaitMs,
+      maxCapacityPauses: options.maxCapacityPauses,
+      signal: controller.signal,
+    });
+  } finally {
+    process.removeListener("SIGINT", cancel);
+    process.removeListener("SIGTERM", cancel);
+  }
+  const report = {
+    kind: outcome.kind,
+    task: outcome.task?.metadata.id ?? options.taskId,
+    state: outcome.task?.metadata.state ?? null,
+    reason: outcome.reason ?? null,
+  };
+  if (outcome.kind === "waiting") {
+    report.retry_at = outcome.retryAt;
+  }
+  console.log(JSON.stringify(report));
+  if (outcome.kind === "done") {
+    return 0;
+  }
+  if (outcome.kind === "blocked") {
+    return 2;
+  }
+  return outcome.kind === "waiting" ? 75 : 1;
 }
 
 if (

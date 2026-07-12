@@ -2,6 +2,7 @@ import { access, mkdir, readdir } from "node:fs/promises";
 import path from "node:path";
 
 import { atomicReplace, countAttempts, TaskStore } from "./documents.js";
+import { SessionLedger } from "./sessions.js";
 
 const TASK_FILE = /^(task-[0-9]{4,})\.md$/;
 const TASK_STATES = ["implement", "review", "approval", "done", "blocked"];
@@ -29,7 +30,18 @@ export async function collectDashboardData(root) {
   const stateCounts = Object.fromEntries(TASK_STATES.map((state) => [state, 0]));
   const rows = [];
   const errors = [];
+  let workerSessions = [];
+  let sessionError = null;
   let project = path.basename(store.root);
+
+  try {
+    const ledger = await new SessionLedger(
+      path.join(store.root, ".aios", "runtime", "sessions.json"),
+    ).load();
+    workerSessions = ledger.sessions;
+  } catch (error) {
+    sessionError = error.message;
+  }
 
   for (const id of ids) {
     let task;
@@ -74,6 +86,8 @@ export async function collectDashboardData(root) {
     stateCounts,
     rows,
     errors,
+    workerSessions,
+    sessionError,
   };
 }
 
@@ -158,6 +172,78 @@ function renderErrorCard(entry) {
     </article>`;
 }
 
+function renderUsage(usage) {
+  if (usage === null) {
+    return "Not reported";
+  }
+  const total =
+    usage.input_tokens +
+    usage.output_tokens +
+    usage.cache_creation_input_tokens +
+    usage.cache_read_input_tokens;
+  return `${total.toLocaleString("en-US")} total (${usage.input_tokens.toLocaleString(
+    "en-US",
+  )} in, ${usage.output_tokens.toLocaleString("en-US")} out)`;
+}
+
+function renderSessionCard(session) {
+  const capacity = session.capacity;
+  const utilization =
+    capacity?.utilization === null || capacity?.utilization === undefined
+      ? "Not reported"
+      : `${Math.round(capacity.utilization * 100)}%`;
+  const refill = capacity?.resets_at ?? "Not reported";
+  const cost =
+    session.cost_usd === null ? "Not reported" : `$${session.cost_usd.toFixed(4)}`;
+  const status = session.outcome;
+  return `
+    <article class="session-card">
+      <div class="task-header">
+        <span class="session-id">${escapeHtml(session.id)}</span>
+        <span class="session-status">${escapeHtml(status)}</span>
+      </div>
+      <h3>${escapeHtml(session.task)} / ${escapeHtml(session.role)}</h3>
+      <div class="field"><span class="field-label">Model</span><span>${escapeHtml(
+        session.model ?? "Not reported",
+      )}</span></div>
+      <div class="field"><span class="field-label">Invocations</span><span>${session.invocations}</span></div>
+      <div class="field"><span class="field-label">Tokens</span><span>${escapeHtml(
+        renderUsage(session.usage),
+      )}</span></div>
+      <div class="field"><span class="field-label">Cost</span><span>${escapeHtml(cost)}</span></div>
+      <div class="field"><span class="field-label">Capacity</span><span>${escapeHtml(
+        capacity?.status ?? "Not reported",
+      )}</span></div>
+      <div class="field"><span class="field-label">Capacity used</span><span>${escapeHtml(
+        utilization,
+      )}</span></div>
+      <div class="field"><span class="field-label">Refill at</span><span>${escapeHtml(
+        refill,
+      )}</span></div>
+      <div class="field"><span class="field-label">Last observed</span><span>${escapeHtml(
+        session.last_seen_at,
+      )}</span></div>
+    </article>`;
+}
+
+function renderWorkerSessions(data) {
+  const body =
+    data.workerSessions.length === 0
+      ? '<p class="empty-state">No Worker sessions recorded yet.</p>'
+      : `<div class="session-grid">${data.workerSessions.map(renderSessionCard).join("\n")}</div>`;
+  const error = data.sessionError
+    ? `<div class="session-ledger-error">Session ledger error: ${escapeHtml(
+        data.sessionError,
+      )}</div>`
+    : "";
+  return `
+    <section class="sessions-section">
+      <h2>Worker Sessions</h2>
+      ${error}
+      ${body}
+    </section>`;
+}
+
 const STYLE = `
   :root { color-scheme: light; }
   * { box-sizing: border-box; }
@@ -175,7 +261,7 @@ const STYLE = `
   .count-value { font-size: 1.5rem; font-weight: 600; }
   .grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr));
     gap: 1rem;
   }
   .task-card {
@@ -223,6 +309,28 @@ const STYLE = `
   .error-card { border-color: #d63939; }
   .error-message { font-size: 0.85rem; white-space: pre-wrap; margin: 0; }
   .errors-section { margin-top: 2rem; }
+  .sessions-section { margin-top: 2rem; border-top: 1px solid #cbd1d9; padding-top: 1.5rem; }
+  .sessions-section h2 { margin: 0 0 1rem; font-size: 1.2rem; }
+  .session-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr));
+    gap: 1rem;
+  }
+  .session-card { background: #fff; border: 1px solid #cfd6df; border-radius: 8px; padding: 1rem; }
+  .session-card h3 { margin: 0 0 0.75rem; font-size: 1rem; }
+  .session-card .field { align-items: flex-start; gap: 1rem; }
+  .session-card .field span:last-child { min-width: 0; text-align: right; overflow-wrap: anywhere; }
+  .session-id { font-family: monospace; overflow-wrap: anywhere; color: #46515f; }
+  .session-status { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; }
+  .empty-state { color: #5b6472; }
+  .session-ledger-error {
+    border: 1px solid #d63939;
+    background: #fff;
+    color: #9b1c1c;
+    padding: 0.75rem;
+    margin-bottom: 1rem;
+    border-radius: 6px;
+  }
 `;
 
 export function renderDashboard(data) {
@@ -245,6 +353,7 @@ ${renderOverview(data)}
 <main class="grid">
 ${cards}
 </main>
+${renderWorkerSessions(data)}
 ${errorCards}
 </body>
 </html>

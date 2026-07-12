@@ -8,9 +8,13 @@ import { stringify } from "yaml";
 import { roleForState, validateResult } from "../src/contracts.js";
 import { TaskStore } from "../src/documents.js";
 import { LoopEngine } from "../src/engine.js";
-import { StaticAssignmentResolver } from "../src/workers.js";
+import {
+  CapacityDeferredError,
+  StaticAssignmentResolver,
+} from "../src/workers.js";
 
 const TASK_ID = "task-9000";
+const CLOCK_START = Date.parse("2026-07-12T00:00:00.000Z");
 
 function result(role, payload, overrides = {}) {
   return {
@@ -56,6 +60,54 @@ class ScriptedWorker {
     }
     return typeof step === "function" ? step(task, role) : step;
   }
+}
+
+class CapacityWorker {
+  constructor(...steps) {
+    this.steps = steps;
+    this.calls = [];
+  }
+
+  async execute(task, { continuation = null } = {}) {
+    const role = roleForState(task.metadata.state);
+    this.calls.push({ task: task.metadata.id, role, continuation });
+    if (this.steps.length === 0) {
+      throw new Error(`Unexpected ${role} invocation`);
+    }
+    const step = this.steps.shift();
+    if (step instanceof Error) {
+      throw step;
+    }
+    return typeof step === "function"
+      ? step(task, role, continuation)
+      : step;
+  }
+}
+
+function deferred(now, delayMs, continuation, sessionId = "session-a") {
+  return new CapacityDeferredError("Worker capacity is temporarily unavailable", {
+    retryAt: new Date(now + delayMs).toISOString(),
+    continuation,
+    sessionId,
+  });
+}
+
+function fakeTime(start = CLOCK_START) {
+  let now = start;
+  const sleeps = [];
+  return {
+    clock: () => now,
+    sleeps,
+    sleep: async (ms, { signal } = {}) => {
+      if (signal?.aborted) {
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        throw error;
+      }
+      sleeps.push(ms);
+      now += ms;
+    },
+  };
 }
 
 class TrackingResolver extends StaticAssignmentResolver {
@@ -465,4 +517,311 @@ test("strict Result validation rejects unknown fields without changing Task", as
   assert.equal(outcome.kind, "halted");
   assert.match(outcome.reason, /must contain exactly/);
   assert.equal(await readFile(taskPath, "utf8"), before);
+});
+
+test("a capacity deferral returns waiting without changing Task state or retry", async (t) => {
+  const { root, taskPath, store } = await createRepository(t);
+  const before = await readFile(taskPath, "utf8");
+  const retryAt = new Date(CLOCK_START + 5_000).toISOString();
+  const worker = new CapacityWorker(
+    deferred(CLOCK_START, 5_000, "continue-implementer"),
+  );
+  let sleepCalls = 0;
+
+  const outcome = await new LoopEngine({
+    root,
+    assignments: new TrackingResolver({ implementer: worker }),
+    clock: () => CLOCK_START,
+    sleep: async () => {
+      sleepCalls += 1;
+    },
+  }).run(TASK_ID);
+
+  assert.equal(outcome.kind, "waiting");
+  assert.equal(outcome.retryAt, retryAt);
+  assert.match(outcome.reason, /capacity/i);
+  assert.deepEqual(worker.calls.map((call) => call.continuation), [null]);
+  assert.equal(sleepCalls, 0);
+  assert.equal(await readFile(taskPath, "utf8"), before);
+  const task = await loadValidated(store);
+  assert.equal(task.metadata.state, "implement");
+  assert.equal(task.metadata.retry.count, 0);
+});
+
+test("capacity wait resumes the same Worker with its continuation and completes", async (t) => {
+  const { root, store } = await createRepository(t);
+  const time = fakeTime();
+  const implementer = new CapacityWorker(
+    deferred(CLOCK_START, 2_500, "continue-1"),
+    implementation("after refill"),
+  );
+  const reviewer = new ScriptedWorker(review("pass"));
+  const assignments = new TrackingResolver({ implementer, reviewer });
+  const sleep = async (ms, options) => {
+    const waitingTask = await loadValidated(store);
+    assert.equal(waitingTask.metadata.state, "implement");
+    assert.equal(waitingTask.metadata.retry.count, 0);
+    await time.sleep(ms, options);
+  };
+
+  const outcome = await new LoopEngine({
+    root,
+    assignments,
+    clock: time.clock,
+    sleep,
+  }).run(TASK_ID, { waitForCapacity: true });
+
+  assert.equal(outcome.kind, "done");
+  assert.deepEqual(time.sleeps, [2_500]);
+  assert.deepEqual(
+    implementer.calls.map((call) => call.continuation),
+    [null, "continue-1"],
+  );
+  assert.deepEqual(assignments.resolutions, ["implementer", "reviewer"]);
+  const task = await loadValidated(store);
+  assert.equal(task.metadata.retry.count, 0);
+});
+
+test("capacity wait supports multiple pauses in one Worker execution", async (t) => {
+  const { root } = await createRepository(t);
+  const time = fakeTime();
+  const implementer = new CapacityWorker(
+    deferred(CLOCK_START, 1_000, "continue-1"),
+    deferred(CLOCK_START, 2_500, "continue-2"),
+    implementation("after two refills"),
+  );
+
+  const outcome = await new LoopEngine({
+    root,
+    assignments: new TrackingResolver({
+      implementer,
+      reviewer: new ScriptedWorker(review("pass")),
+    }),
+    clock: time.clock,
+    sleep: time.sleep,
+  }).run(TASK_ID, { waitForCapacity: true });
+
+  assert.equal(outcome.kind, "done");
+  assert.deepEqual(time.sleeps, [1_000, 1_500]);
+  assert.deepEqual(
+    implementer.calls.map((call) => call.continuation),
+    [null, "continue-1", "continue-2"],
+  );
+});
+
+test("capacity pause limits apply across Role transitions in one run", async (t) => {
+  const { root, store } = await createRepository(t);
+  const time = fakeTime();
+  const implementer = new CapacityWorker(
+    deferred(CLOCK_START, 100, "continue-implementer"),
+    implementation("after implementer refill"),
+  );
+  const reviewer = new CapacityWorker(
+    deferred(CLOCK_START, 200, "continue-reviewer", "session-reviewer"),
+  );
+
+  const outcome = await new LoopEngine({
+    root,
+    assignments: new TrackingResolver({ implementer, reviewer }),
+    clock: time.clock,
+    sleep: time.sleep,
+  }).run(TASK_ID, {
+    waitForCapacity: true,
+    maxCapacityPauses: 1,
+    maxCapacityWaitMs: 1_000,
+  });
+
+  assert.equal(outcome.kind, "halted");
+  assert.match(outcome.reason, /pause limit exceeded/i);
+  assert.deepEqual(time.sleeps, [100]);
+  assert.equal(implementer.calls.length, 2);
+  assert.equal(reviewer.calls.length, 1);
+  const task = await loadValidated(store);
+  assert.equal(task.metadata.state, "review");
+  assert.equal(task.metadata.retry.count, 0);
+});
+
+test("capacity wait enforces pause count and cumulative wait bounds", async (t) => {
+  await t.test("pause count", async (st) => {
+    const { root, taskPath } = await createRepository(st);
+    const before = await readFile(taskPath, "utf8");
+    const time = fakeTime();
+    const worker = new CapacityWorker(
+      deferred(CLOCK_START, 100, "continue-1"),
+      deferred(CLOCK_START, 200, "continue-2"),
+    );
+    const outcome = await new LoopEngine({
+      root,
+      assignments: new TrackingResolver({ implementer: worker }),
+      clock: time.clock,
+      sleep: time.sleep,
+    }).run(TASK_ID, {
+      waitForCapacity: true,
+      maxCapacityPauses: 1,
+      maxCapacityWaitMs: 1_000,
+    });
+
+    assert.equal(outcome.kind, "halted");
+    assert.match(outcome.reason, /pause limit exceeded/i);
+    assert.deepEqual(time.sleeps, [100]);
+    assert.equal(worker.calls.length, 2);
+    assert.equal(await readFile(taskPath, "utf8"), before);
+  });
+
+  await t.test("cumulative wait", async (st) => {
+    const { root, taskPath } = await createRepository(st);
+    const before = await readFile(taskPath, "utf8");
+    const time = fakeTime();
+    const worker = new CapacityWorker(
+      deferred(CLOCK_START, 600, "continue-1"),
+      deferred(CLOCK_START, 1_200, "continue-2"),
+    );
+    const outcome = await new LoopEngine({
+      root,
+      assignments: new TrackingResolver({ implementer: worker }),
+      clock: time.clock,
+      sleep: time.sleep,
+    }).run(TASK_ID, {
+      waitForCapacity: true,
+      maxCapacityPauses: 4,
+      maxCapacityWaitMs: 1_000,
+    });
+
+    assert.equal(outcome.kind, "halted");
+    assert.match(outcome.reason, /wait limit exceeded/i);
+    assert.deepEqual(time.sleeps, [600]);
+    assert.equal(worker.calls.length, 2);
+    assert.equal(await readFile(taskPath, "utf8"), before);
+  });
+});
+
+test("capacity wait handles cancellation and sleep rejection without resuming", async (t) => {
+  await t.test("cancellation", async (st) => {
+    const { root } = await createRepository(st);
+    const controller = new AbortController();
+    controller.abort();
+    const worker = new CapacityWorker(
+      deferred(CLOCK_START, 100, "never-resume"),
+    );
+    const outcome = await new LoopEngine({
+      root,
+      assignments: new TrackingResolver({ implementer: worker }),
+      clock: () => CLOCK_START,
+      sleep: fakeTime().sleep,
+    }).run(TASK_ID, { waitForCapacity: true, signal: controller.signal });
+
+    assert.equal(outcome.kind, "halted");
+    assert.match(outcome.reason, /cancelled/i);
+    assert.equal(worker.calls.length, 1);
+  });
+
+  await t.test("sleep rejection", async (st) => {
+    const { root } = await createRepository(st);
+    const worker = new CapacityWorker(
+      deferred(CLOCK_START, 100, "never-resume"),
+    );
+    const outcome = await new LoopEngine({
+      root,
+      assignments: new TrackingResolver({ implementer: worker }),
+      clock: () => CLOCK_START,
+      sleep: async () => {
+        throw new Error("timer service unavailable");
+      },
+    }).run(TASK_ID, { waitForCapacity: true });
+
+    assert.equal(outcome.kind, "halted");
+    assert.match(outcome.reason, /wait failed: timer service unavailable/i);
+    assert.equal(worker.calls.length, 1);
+  });
+});
+
+test("a Task mutation while sleeping wins over capacity continuation", async (t) => {
+  const { root, taskPath } = await createRepository(t);
+  const before = await readFile(taskPath, "utf8");
+  const worker = new CapacityWorker(
+    deferred(CLOCK_START, 100, "must-not-resume"),
+  );
+
+  const outcome = await new LoopEngine({
+    root,
+    assignments: new TrackingResolver({ implementer: worker }),
+    clock: () => CLOCK_START,
+    sleep: async () => {
+      await writeFile(taskPath, `${before}\n`, "utf8");
+    },
+  }).run(TASK_ID, { waitForCapacity: true });
+
+  assert.equal(outcome.kind, "halted");
+  assert.match(outcome.reason, /changed while waiting/i);
+  assert.equal(worker.calls.length, 1);
+  assert.equal(await readFile(taskPath, "utf8"), `${before}\n`);
+});
+
+test("a stale capacity reset halts without sleeping", async (t) => {
+  const { root, taskPath } = await createRepository(t);
+  const before = await readFile(taskPath, "utf8");
+  const worker = new CapacityWorker(
+    new CapacityDeferredError("stale capacity reset", {
+      retryAt: new Date(CLOCK_START).toISOString(),
+      continuation: "never-resume",
+      sessionId: "session-a",
+    }),
+  );
+  let sleepCalls = 0;
+
+  const outcome = await new LoopEngine({
+    root,
+    assignments: new TrackingResolver({ implementer: worker }),
+    clock: () => CLOCK_START,
+    sleep: async () => {
+      sleepCalls += 1;
+    },
+  }).run(TASK_ID, { waitForCapacity: true });
+
+  assert.equal(outcome.kind, "halted");
+  assert.match(outcome.reason, /stale or malformed/i);
+  assert.equal(sleepCalls, 0);
+  assert.equal(await readFile(taskPath, "utf8"), before);
+});
+
+test("a generic Worker error never enters capacity sleep", async (t) => {
+  const { root, taskPath } = await createRepository(t);
+  const before = await readFile(taskPath, "utf8");
+  let sleepCalls = 0;
+
+  const outcome = await new LoopEngine({
+    root,
+    assignments: new TrackingResolver({
+      implementer: new ScriptedWorker(new Error("ordinary worker failure")),
+    }),
+    clock: () => CLOCK_START,
+    sleep: async () => {
+      sleepCalls += 1;
+    },
+  }).run(TASK_ID, { waitForCapacity: true });
+
+  assert.equal(outcome.kind, "halted");
+  assert.match(outcome.reason, /ordinary worker failure/);
+  assert.equal(sleepCalls, 0);
+  assert.equal(await readFile(taskPath, "utf8"), before);
+});
+
+test("capacity wait bounds must be positive integers", async (t) => {
+  const { root } = await createRepository(t);
+  const engine = new LoopEngine({
+    root,
+    assignments: new TrackingResolver(),
+  });
+
+  for (const options of [
+    { maxCapacityWaitMs: 0 },
+    { maxCapacityWaitMs: 1.5 },
+    { maxCapacityPauses: 0 },
+    { maxCapacityPauses: Number.POSITIVE_INFINITY },
+  ]) {
+    const outcome = await engine.run(TASK_ID, options);
+    assert.equal(outcome.kind, "halted");
+    assert.equal(outcome.task, null);
+    assert.match(outcome.reason, /positive integer/i);
+  }
 });

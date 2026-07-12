@@ -40,11 +40,44 @@ changes the Worker without changing the Task or Loop Engine.
 
 `aios run` exits with 0 when the Task reaches `done`, 2 when it reaches
 `blocked`, 1 when the run halts for operator recovery, and 64 for a usage
-error.
+error. A structured capacity deferral exits with 75 and reports `retry_at`
+unless capacity waiting is enabled.
 
 Assignment commands are trusted local configuration and run with the current
 user's permissions. Do not execute an Assignment file from an untrusted
 repository.
+
+## Capacity Wait and Session Usage
+
+Capacity waiting is explicit. Keep one foreground Task run alive across a
+provider-reported refill window with:
+
+```console
+npm run aios -- run task-0009 --wait-for-capacity
+```
+
+`--max-capacity-wait-ms` bounds the cumulative requested wait (default
+`604800000`, seven days), and `--max-capacity-pauses` bounds deferrals across
+the whole foreground run (default `8`). The child Worker timeout still applies
+to each active invocation; refill sleep happens after the child exits. Ctrl+C
+or SIGTERM cancels the sleep.
+
+The engine waits only for the command transport's structured capacity signal
+with a future `retry_at` and opaque continuation. It checks the Task bytes
+before sleeping and again before resuming the same resolved Worker. A capacity
+pause does not change Task state, consume Task retries, append an Attempt, or
+create a Review. Authentication, billing, permission, network, timeout,
+malformed output, and ordinary Result failures still halt for operator
+inspection. Token counts are telemetry only and are never used to guess a
+refill time.
+
+Structured Claude runs are recorded in the git-ignored
+`.aios/runtime/sessions.json`. This atomic operational ledger keeps one row per
+provider session with Task, Role, model, invocation count, token usage, cost,
+latest capacity utilization, and reset time when Claude supplies them. Usage
+and cost are accumulated across resumed invocations of the same session. The
+ledger is not Task lifecycle truth and can be deleted without changing any
+Task.
 
 ## Dashboard
 
@@ -72,8 +105,10 @@ not yet exist is flagged with the exact path a human must write `approved`
 or `rejected` to. Tasks and Reviews are loaded with the same strict
 validation the Loop Engine uses; a document that fails to load is rendered
 as a visible error card naming the document and reason instead of aborting
-the whole dashboard. The HTML uses inline CSS only and needs no JavaScript
-for its core view.
+the whole dashboard. A separate Worker Sessions section shows the operational
+ledger's usage and refill information; a missing ledger is an empty state and
+an invalid one is a visible error. The HTML uses inline CSS only and needs no
+JavaScript for its core view.
 
 ## Command Worker
 
@@ -84,6 +119,12 @@ interpolation. The repository root is their working directory. A Worker:
 2. Reads `AIOS_TASK_ID` and `AIOS_ROLE` from the environment when useful.
 3. Writes exactly one `aios.result/v1` JSON object to stdout.
 4. Writes diagnostic logs only to stderr.
+
+A session-aware command adapter may instead write one strict
+`aios.worker-execution/v1` transport envelope containing either its Result or
+a capacity deferral plus session telemetry. `CommandWorker` records and
+unwraps that envelope, so the Loop Engine still sees `execute(Task) -> Result`.
+Other command Workers remain unchanged.
 
 On Windows, `.cmd` and `.ps1` shims are intentionally not opened through an
 implicit shell. Name a safe interpreter explicitly, for example:
@@ -103,11 +144,12 @@ rolled back; an operator must inspect them before explicitly resuming.
 
 `workers/claude-worker.mjs` binds a Role to one non-interactive Claude Code
 session. It follows the command Worker contract: Task document on stdin,
-`AIOS_ROLE`/`AIOS_TASK_ID` in the environment, one `aios.result/v1` object
-on stdout. The session's JSON-only reply becomes the Result payload; a
-reply of `{"failure_reason": "..."}` becomes a `status: failure` Result,
-and anything unusable exits nonzero so the engine halts without a Task
-transition.
+`AIOS_ROLE`/`AIOS_TASK_ID` in the environment, and one structured execution
+envelope on stdout. It consumes Claude Code NDJSON events. The session's
+JSON-only reply becomes the Result payload; a reply of
+`{"failure_reason": "..."}` becomes a `status: failure` Result, and anything
+structured but unusable becomes a telemetry-bearing failure Result. Malformed
+transport output exits nonzero. Both paths halt without a Task transition.
 
 ```json
 {
@@ -119,22 +161,29 @@ transition.
 }
 ```
 
-The trailing argument (or `AIOS_CLAUDE_CLI`) names the Claude executable —
+The trailing argument (or `AIOS_CLAUDE_CLI`) names the Claude executable;
 required on Windows when `claude` resolves to a `.ps1`/`.cmd` shim, because
 Workers are spawned without a shell. `AIOS_CLAUDE_MODEL` overrides the
 model alias (default `sonnet`).
 
 Permission model: the Implementer session runs with `acceptEdits` and Bash
-allowed — it is the one Role meant to change the repository. Reviewer and
+allowed; it is the one Role meant to change the repository. Reviewer and
 Approver sessions keep the default non-interactive permissions, where only
 read-only tools plus `npm test` work. Prompts additionally forbid every
 session from touching `.aios/` or git history; the engine's conflict
 detection halts the run if a Worker modifies the active Task anyway.
 
-Caveats: each Role action starts a fresh session that bills usage, and an
-Implementer session executes with your local permissions — assign it only
-to repositories you trust it to edit, and raise `--timeout-ms` (Sprint 0
-default 300000) for real implementation work.
+The adapter maps only Claude Code's structured `rate_limit_event` with
+`status: rejected`, numeric `resetsAt`, and `session_id` to a capacity
+deferral. It does not parse error prose. A resumed invocation receives the
+opaque continuation through `AIOS_WORKER_CONTINUATION` and uses that exact id
+with `--resume`. Final usage and cost plus the latest structured utilization
+and reset are copied into the session ledger.
+
+Caveats: each Role action starts a fresh session unless it is resuming a
+capacity pause, and each active invocation bills usage. An Implementer session
+executes with your local permissions; assign it only to repositories you trust
+it to edit, and raise `--timeout-ms` (Sprint 0 default 300000) for real work.
 
 ## Human Approver Worker
 
@@ -201,4 +250,6 @@ editor that materializes CRLF keeps framed Tasks readable.
 Sprint 0 assumes one foreground Loop Engine. It does not guarantee exactly-once
 external side effects after a process crash. Review-first persistence and
 orphan recovery protect the Task/Review control documents, while broader
-scheduling and concurrency remain future requirements.
+scheduling and concurrency remain future requirements. Capacity continuation
+also requires the foreground process to remain alive; there is no daemon, OS
+wakeup, or reboot-safe session resume.

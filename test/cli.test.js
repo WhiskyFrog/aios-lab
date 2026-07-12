@@ -53,6 +53,108 @@ test("a usage error exits with code 64, distinct from blocked", async () => {
   );
 });
 
+test("capacity without opt-in exits 75 and reports retry_at without moving the Task", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aios-cli-waiting-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, ".aios", "tasks"), { recursive: true });
+  await mkdir(path.join(root, ".aios", "reviews"), { recursive: true });
+  await writeFile(
+    path.join(root, ".aios", "tasks", "task-9001.md"),
+    taskDocument(),
+    "utf8",
+  );
+  const assignmentsPath = path.join(root, ".aios", "assignments.json");
+  await writeFile(
+    assignmentsPath,
+    JSON.stringify({
+      schema: "aios.assignments/v1",
+      assignments: { implementer: [process.execPath, fixture, "deferred"] },
+    }),
+    "utf8",
+  );
+
+  await assert.rejects(
+    executeFile(
+      process.execPath,
+      [cli, "run", "task-9001", "--root", root, "--assignments", assignmentsPath],
+      { cwd: root, windowsHide: true },
+    ),
+    (error) => {
+      const report = JSON.parse(error.stdout);
+      return (
+        error.code === 75 &&
+        report.kind === "waiting" &&
+        report.state === "implement" &&
+        typeof report.retry_at === "string"
+      );
+    },
+  );
+
+  const task = await new TaskStore(root).loadTask("task-9001");
+  assert.equal(task.metadata.state, "implement");
+  assert.equal(task.metadata.retry.count, 0);
+  const ledger = JSON.parse(
+    await readFile(path.join(root, ".aios", "runtime", "sessions.json"), "utf8"),
+  );
+  assert.equal(ledger.sessions[0].outcome, "capacity_deferred");
+});
+
+test("--wait-for-capacity resumes exact sessions and completes the Role loop", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aios-cli-capacity-loop-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, ".aios", "tasks"), { recursive: true });
+  await mkdir(path.join(root, ".aios", "reviews"), { recursive: true });
+  await writeFile(
+    path.join(root, ".aios", "tasks", "task-9001.md"),
+    taskDocument(),
+    "utf8",
+  );
+  const marker = path.join(root, "capacity-marker");
+  const assignmentsPath = path.join(root, ".aios", "assignments.json");
+  await writeFile(
+    assignmentsPath,
+    JSON.stringify({
+      schema: "aios.assignments/v1",
+      assignments: {
+        implementer: [process.execPath, fixture, "capacity-loop", marker],
+        reviewer: [process.execPath, fixture, "capacity-loop", marker],
+      },
+    }),
+    "utf8",
+  );
+
+  const { stdout } = await executeFile(
+    process.execPath,
+    [
+      cli,
+      "run",
+      "task-9001",
+      "--root",
+      root,
+      "--assignments",
+      assignmentsPath,
+      "--wait-for-capacity",
+      "--max-capacity-wait-ms",
+      "1000",
+      "--max-capacity-pauses",
+      "2",
+    ],
+    { cwd: root, windowsHide: true },
+  );
+
+  assert.equal(JSON.parse(stdout).kind, "done");
+  const ledger = JSON.parse(
+    await readFile(path.join(root, ".aios", "runtime", "sessions.json"), "utf8"),
+  );
+  assert.deepEqual(
+    ledger.sessions.map((session) => [session.role, session.invocations]),
+    [
+      ["implementer", 2],
+      ["reviewer", 2],
+    ],
+  );
+});
+
 test("one CLI trigger runs command Implementer and Reviewer through done", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "aios-cli-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));

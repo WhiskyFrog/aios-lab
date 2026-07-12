@@ -43,6 +43,20 @@ Results never contain an agent, provider, model, API, CLI, or human
 identity, and never contain a Review ID or Attempt number: the engine
 allocates identifiers.
 
+## Command Transport
+
+The Result v1 shape above is unchanged. A session-aware command process may
+wrap either one Result or one capacity deferral in an
+`aios.worker-execution/v1` transport envelope. `CommandWorker` strictly
+validates that envelope, records its separate session telemetry, and unwraps
+the Result before returning from `execute(Task)`. The Loop Engine therefore
+still receives only Result v1 for a completed Worker action.
+
+Capacity control and session telemetry never become Result fields. They also
+never move a Task, allocate an Attempt or Review, or consume `retry.count`.
+The transport shape and operational ledger are documented in the root
+README and validated by `src/sessions.js`.
+
 ## Success Payloads
 
 Each Role's payload is defined by its field table. Every field is required

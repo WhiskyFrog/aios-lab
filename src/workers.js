@@ -3,6 +3,11 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 
 import { roleForState } from "./contracts.js";
+import {
+  SessionLedger,
+  WORKER_EXECUTION_SCHEMA,
+  validateWorkerExecution,
+} from "./sessions.js";
 
 const ROLES = new Set(["implementer", "reviewer", "approver"]);
 
@@ -20,7 +25,17 @@ export class WorkerError extends Error {
   }
 }
 
-function terminateProcessTree(child) {
+export class CapacityDeferredError extends WorkerError {
+  constructor(message, { retryAt, continuation, sessionId = null }) {
+    super(message);
+    this.name = "CapacityDeferredError";
+    this.retryAt = retryAt;
+    this.continuation = continuation;
+    this.sessionId = sessionId;
+  }
+}
+
+export function terminateProcessTree(child) {
   if (!child.pid) {
     return Promise.resolve();
   }
@@ -68,6 +83,19 @@ function terminateProcessTree(child) {
   return Promise.resolve();
 }
 
+export function workerEnvironment(environment, taskId, role, continuation = null) {
+  const env = {
+    ...environment,
+    AIOS_TASK_ID: taskId,
+    AIOS_ROLE: role,
+  };
+  delete env.AIOS_WORKER_CONTINUATION;
+  if (continuation !== null) {
+    env.AIOS_WORKER_CONTINUATION = continuation;
+  }
+  return env;
+}
+
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -98,39 +126,65 @@ function validateCommand(command, role) {
 }
 
 export class CommandWorker {
-  constructor(command, { cwd, timeoutMs = 300_000, outputLimit = 1_048_576 } = {}) {
+  constructor(
+    command,
+    { cwd, timeoutMs = 300_000, outputLimit = 1_048_576, ledger = null } = {},
+  ) {
     this.command = validateCommand(command, "command");
     this.cwd = path.resolve(cwd ?? process.cwd());
     this.timeoutMs = timeoutMs;
     this.outputLimit = outputLimit;
+    this.ledger = ledger;
   }
 
-  async execute(task) {
+  async execute(task, { continuation = null, signal = undefined } = {}) {
     const role = roleForState(task.metadata.state);
     if (role === null) {
       throw new WorkerError(`Task state ${task.metadata.state} has no active Role`);
+    }
+    if (
+      continuation !== null &&
+      (typeof continuation !== "string" || continuation.trim().length === 0)
+    ) {
+      throw new WorkerError("Worker continuation must be a non-empty string");
     }
     const [executable, ...args] = this.command;
     return new Promise((resolve, reject) => {
       let stdout = "";
       let stderr = "";
       let timedOut = false;
+      let aborted = false;
       let exceededLimit = false;
       let terminationStarted = false;
       let termination = Promise.resolve();
 
+      const env = workerEnvironment(
+        process.env,
+        task.metadata.id,
+        role,
+        continuation,
+      );
+
       const child = spawn(executable, args, {
         cwd: this.cwd,
-        env: {
-          ...process.env,
-          AIOS_TASK_ID: task.metadata.id,
-          AIOS_ROLE: role,
-        },
+        env,
         shell: false,
         detached: process.platform !== "win32",
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
       });
+
+      const abort = () => {
+        aborted = true;
+        if (!terminationStarted) {
+          terminationStarted = true;
+          termination = terminateProcessTree(child);
+        }
+      };
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted === true) {
+        abort();
+      }
 
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
@@ -161,12 +215,18 @@ export class CommandWorker {
 
       child.once("error", (error) => {
         clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
         reject(new WorkerError(`Unable to start Worker: ${error.message}`, { cause: error }));
       });
 
-      child.once("close", async (code, signal) => {
+      child.once("close", async (code, exitSignal) => {
         clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
         await termination;
+        if (aborted) {
+          reject(new WorkerError("Worker execution was cancelled"));
+          return;
+        }
         if (timedOut) {
           reject(new WorkerError(`Worker timed out after ${this.timeoutMs} ms`));
           return;
@@ -179,9 +239,9 @@ export class CommandWorker {
           const detail = stderr.trim();
           reject(
             new WorkerError(
-              `Worker exited with code ${String(code)}${signal ? ` (${signal})` : ""}${
-                detail ? `: ${detail}` : ""
-              }`,
+              `Worker exited with code ${String(code)}${
+                exitSignal ? ` (${exitSignal})` : ""
+              }${detail ? `: ${detail}` : ""}`,
             ),
           );
           return;
@@ -192,13 +252,58 @@ export class CommandWorker {
           reject(new WorkerError("Worker returned an empty stdout Result"));
           return;
         }
+        let parsed;
         try {
-          resolve(JSON.parse(output));
+          parsed = JSON.parse(output);
         } catch (error) {
           reject(new WorkerError("Worker stdout must be exactly one JSON Result", {
             cause: error,
           }));
+          return;
         }
+
+        if (parsed?.schema !== WORKER_EXECUTION_SCHEMA) {
+          resolve(parsed);
+          return;
+        }
+
+        let execution;
+        try {
+          execution = validateWorkerExecution(parsed);
+          if (
+            execution.session.task !== task.metadata.id ||
+            execution.session.role !== role
+          ) {
+            throw new Error(
+              "Worker execution session does not match the active Task and Role",
+            );
+          }
+          if (this.ledger !== null) {
+            await this.ledger.record(execution.session);
+          }
+        } catch (error) {
+          reject(
+            new WorkerError(`Invalid Worker execution envelope: ${error.message}`, {
+              cause: error,
+            }),
+          );
+          return;
+        }
+
+        if (execution.deferred !== null) {
+          reject(
+            new CapacityDeferredError(
+              `Worker capacity is unavailable until ${execution.deferred.retry_at}`,
+              {
+                retryAt: execution.deferred.retry_at,
+                continuation: execution.deferred.continuation,
+                sessionId: execution.session.id,
+              },
+            ),
+          );
+          return;
+        }
+        resolve(execution.result);
       });
 
       child.stdin.on("error", () => {});
@@ -230,10 +335,13 @@ export class StaticAssignmentResolver {
 }
 
 export class FileAssignmentResolver {
-  constructor(configPath, { cwd, timeoutMs = 300_000 } = {}) {
+  constructor(configPath, { cwd, timeoutMs = 300_000, ledger = null } = {}) {
     this.configPath = path.resolve(configPath);
     this.cwd = path.resolve(cwd ?? path.dirname(this.configPath));
     this.timeoutMs = timeoutMs;
+    this.ledger =
+      ledger ??
+      new SessionLedger(path.join(this.cwd, ".aios", "runtime", "sessions.json"));
   }
 
   async resolve(role) {
@@ -268,6 +376,7 @@ export class FileAssignmentResolver {
     return new CommandWorker(command, {
       cwd: this.cwd,
       timeoutMs: this.timeoutMs,
+      ledger: this.ledger,
     });
   }
 }
