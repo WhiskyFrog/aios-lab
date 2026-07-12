@@ -165,6 +165,10 @@ function attemptNumbers(body) {
   ];
 }
 
+export function countAttempts(body) {
+  return attemptNumbers(body).length;
+}
+
 function validateAttemptProjection(body, metadata) {
   const numbers = attemptNumbers(body);
   const expectedCount =

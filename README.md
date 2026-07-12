@@ -46,6 +46,35 @@ Assignment commands are trusted local configuration and run with the current
 user's permissions. Do not execute an Assignment file from an untrusted
 repository.
 
+## Dashboard
+
+`aios dashboard` generates one self-contained, offline HTML file summarizing
+every Task's lifecycle position and evidence, so an operator can see what
+the loop is doing and what needs a human without reconstructing state from
+raw `.aios/` files:
+
+```console
+npm run aios -- dashboard --root . --out dashboard.html
+```
+
+It prints the written path and defaults to `dashboard.html` at the
+repository root (`--root`, default the current directory) when `--out` is
+omitted. The command is a one-shot, read-only pass: no server, no
+watcher, no daemon, and it never modifies anything under `.aios/`.
+`dashboard.html` is git-ignored.
+
+The page shows an overview (project, Task counts per state, generation
+time) and one card per Task with its id, title, a state badge, retry
+count/limit, `approval`, its latest Review id/verdict with the Review's
+findings in a collapsible section, and its recorded Attempt count. A Task
+in `state: approval` whose decision file `.aios/approvals/<task-id>` does
+not yet exist is flagged with the exact path a human must write `approved`
+or `rejected` to. Tasks and Reviews are loaded with the same strict
+validation the Loop Engine uses; a document that fails to load is rendered
+as a visible error card naming the document and reason instead of aborting
+the whole dashboard. The HTML uses inline CSS only and needs no JavaScript
+for its core view.
+
 ## Command Worker
 
 Commands are launched directly from their argv array with no shell

@@ -3,6 +3,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { writeDashboard } from "./dashboard.js";
 import { LoopEngine } from "./engine.js";
 import { FileAssignmentResolver } from "./workers.js";
 
@@ -10,32 +11,36 @@ function usage() {
   return [
     "Usage:",
     "  aios run <task-id> [--root <path>] [--assignments <path>] [--timeout-ms <n>]",
+    "  aios dashboard [--root <path>] [--out <file>]",
     "",
-    "The command runs one Task through each assigned Role until it is done,",
-    "blocked, or halted by an execution/configuration error.",
+    "The run command runs one Task through each assigned Role until it is",
+    "done, blocked, or halted by an execution/configuration error.",
     "",
-    "Exit codes: 0 done, 1 halted, 2 blocked, 64 usage error.",
+    "The dashboard command generates a self-contained HTML overview of every",
+    "Task's lifecycle position and evidence (default dashboard.html at the",
+    "repository root); it is a read-only, one-shot pass and never modifies",
+    "anything under .aios/.",
+    "",
+    "Exit codes: run — 0 done, 1 halted, 2 blocked, 64 usage error.",
+    "            dashboard — 0 written, 64 usage error.",
   ].join("\n");
 }
 
-function parseArguments(argv) {
-  if (argv.length === 0 || argv.includes("--help") || argv.includes("-h")) {
-    return { help: true };
-  }
-  if (argv[0] !== "run" || argv.length < 2) {
+function parseRunArguments(rest) {
+  if (rest.length < 1) {
     throw new Error(usage());
   }
-
   const options = {
     help: false,
-    taskId: argv[1],
+    command: "run",
+    taskId: rest[0],
     root: process.cwd(),
     assignments: null,
     timeoutMs: 300_000,
   };
-  for (let index = 2; index < argv.length; index += 1) {
-    const flag = argv[index];
-    const value = argv[index + 1];
+  for (let index = 1; index < rest.length; index += 1) {
+    const flag = rest[index];
+    const value = rest[index + 1];
     if (!value) {
       throw new Error(`Missing value for ${flag}`);
     }
@@ -57,6 +62,46 @@ function parseArguments(argv) {
   return options;
 }
 
+function parseDashboardArguments(rest) {
+  const options = {
+    help: false,
+    command: "dashboard",
+    root: process.cwd(),
+    out: null,
+  };
+  for (let index = 0; index < rest.length; index += 1) {
+    const flag = rest[index];
+    const value = rest[index + 1];
+    if (!value) {
+      throw new Error(`Missing value for ${flag}`);
+    }
+    if (flag === "--root") {
+      options.root = path.resolve(value);
+    } else if (flag === "--out") {
+      options.out = path.resolve(value);
+    } else {
+      throw new Error(`Unknown option ${flag}`);
+    }
+    index += 1;
+  }
+  options.out ??= path.join(options.root, "dashboard.html");
+  return options;
+}
+
+function parseArguments(argv) {
+  if (argv.length === 0 || argv.includes("--help") || argv.includes("-h")) {
+    return { help: true };
+  }
+  const [command, ...rest] = argv;
+  if (command === "run") {
+    return parseRunArguments(rest);
+  }
+  if (command === "dashboard") {
+    return parseDashboardArguments(rest);
+  }
+  throw new Error(usage());
+}
+
 export async function main(argv = process.argv.slice(2)) {
   let options;
   try {
@@ -67,6 +112,12 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (options.help) {
     console.log(usage());
+    return 0;
+  }
+
+  if (options.command === "dashboard") {
+    const writtenPath = await writeDashboard({ root: options.root, out: options.out });
+    console.log(writtenPath);
     return 0;
   }
 
