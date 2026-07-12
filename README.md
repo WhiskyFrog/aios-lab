@@ -185,6 +185,67 @@ capacity pause, and each active invocation bills usage. An Implementer session
 executes with your local permissions; assign it only to repositories you trust
 it to edit, and raise `--timeout-ms` (Sprint 0 default 300000) for real work.
 
+## Codex Workers
+
+`workers/codex-worker.mjs` binds a Role to one non-interactive OpenAI Codex
+(`codex exec`) session, interchangeable with `workers/claude-worker.mjs`
+through Assignment configuration alone: both adapters use the same Role
+prompts, the same reply extraction and payload validation (shared in
+`workers/worker-shared.mjs`), and the same failure discipline. It follows the
+command Worker contract: Task document on stdin, `AIOS_ROLE`/`AIOS_TASK_ID`
+in the environment, one `aios.result/v1` object on stdout. Codex has no
+capacity-deferral signal in scope here, so the adapter always emits a bare
+Result — never the `aios.worker-execution/v1` transport envelope — which
+`CommandWorker` accepts unchanged.
+
+```json
+{
+  "schema": "aios.assignments/v1",
+  "assignments": {
+    "implementer": ["node", "workers/codex-worker.mjs", "C:\\path\\to\\codex.exe"],
+    "reviewer": ["node", "workers/codex-worker.mjs", "C:\\path\\to\\codex.exe"]
+  }
+}
+```
+
+The trailing argv tokens (or `AIOS_CODEX_CLI`) name the Codex launcher — one
+or more tokens, so both a native binary path and a portable
+`["node", "C:\\path\\to\\cli.js"]` pair work. `AIOS_CODEX_MODEL` is passed as
+`--model` when set; otherwise the CLI's configured default model is used.
+
+On Windows, the PATH entry `codex` typically resolves to a PowerShell shim
+(`codex.ps1`/`codex.cmd`), and Workers are spawned without a shell, so name
+the real launcher explicitly — the vendored native `codex.exe`, or `node`
+plus the portable `cli.js` — exactly as with the `.cmd`/`.ps1` caveat
+documented above for other command Workers.
+
+Sandbox mapping: each Role action launches exactly one `codex exec` session
+with `--sandbox workspace-write` for the Implementer (the one Role meant to
+change the repository) and `--sandbox read-only` for the Reviewer and
+Approver. The `--dangerously-*` bypass flags are never used.
+
+The reply is read deterministically from a temporary
+`--output-last-message` file, which is removed after each session regardless
+of outcome. A valid role payload becomes a `status: success` Result, a
+`{"failure_reason": "..."}` reply becomes a `status: failure` Result, and
+anything unusable — an unparseable or invalid reply, a missing final-message
+file, or a nonzero `codex exec` exit — makes the adapter exit nonzero with no
+stdout, so the engine halts without a Task transition.
+
+Mixed-vendor example — bind different Roles to different providers in one
+Assignment file:
+
+```json
+{
+  "schema": "aios.assignments/v1",
+  "assignments": {
+    "implementer": ["node", "workers/codex-worker.mjs", "C:\\path\\to\\codex.exe"],
+    "reviewer": ["node", "workers/claude-worker.mjs", "C:\\path\\to\\claude.exe"],
+    "approver": ["node", "workers/human-approver.mjs"]
+  }
+}
+```
+
 ## Human Approver Worker
 
 `workers/human-approver.mjs` binds the `approver` Role to a human operator
