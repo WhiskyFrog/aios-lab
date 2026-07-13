@@ -438,3 +438,27 @@ orphan recovery protect the Task/Review control documents, while broader
 scheduling and concurrency remain future requirements. Capacity continuation
 also requires the foreground process to remain alive; there is no daemon, OS
 wakeup, or reboot-safe session resume.
+
+## Roadmap
+
+The next active milestone is `task-0017`: use the Planner to decompose a
+narrow, operator-invoked runner that advances through the ordered real Tasks in
+one adopted plan. It must reuse the existing single-Task Loop Engine, resume
+from repository state, and stop safely at Review, Approval, capacity, blocked,
+failure, cancellation, or conflict boundaries. This is sequential plan
+progression, not concurrent scheduling or a daemon.
+
+The follow-on milestone is adaptive model routing. Once sequential progression
+is reliable, AIOS should evaluate each Task and Role using explicit evidence
+such as Planner profile, complexity, risk, context size, tool requirements,
+verification burden, latency, and cost budget, then choose from an explicit
+Claude-and-Codex candidate pool. Fitness comes first, but equivalent candidates
+follow a configurable distribution target so assignments do not drift toward a
+single provider; Implementer and Reviewer should use different providers when
+both are eligible. Capacity, timeout, and provider failures use a declared
+cross-provider fallback. The current Role-only Assignment resolver will need a
+Task-and-Role-aware policy layer, while Task documents remain provider-neutral.
+Operator overrides and an auditable record of the chosen provider/model,
+alternatives, rationale, fallback, and distribution effect are required. Model
+routing remains separate from `task-0017` so workflow correctness and routing
+quality can be verified independently.
