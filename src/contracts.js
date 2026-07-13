@@ -79,7 +79,10 @@ export function currentAttempt(task) {
   return task.retry.count + 1;
 }
 
-export function validateTaskMetadata(value) {
+export function validateTaskMetadata(
+  value,
+  { idPattern = /^task-[0-9]{4,}$/ } = {},
+) {
   requireExactKeys(
     value,
     [
@@ -98,7 +101,7 @@ export function validateTaskMetadata(value) {
   if (value.schema !== "aios.task/v1") {
     throw new ContractError("Task schema must be aios.task/v1");
   }
-  requirePattern(value.id, /^task-[0-9]{4,}$/, "Task id");
+  requirePattern(value.id, idPattern, "Task id");
   requirePattern(
     value.project,
     /^[a-z0-9][a-z0-9-]*$/,

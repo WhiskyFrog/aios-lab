@@ -96,19 +96,119 @@ omitted. The command is a one-shot, read-only pass: no server, no
 watcher, no daemon, and it never modifies anything under `.aios/`.
 `dashboard.html` is git-ignored.
 
-The page shows an overview (project, Task counts per state, generation
-time) and one card per Task with its id, title, a state badge, retry
-count/limit, `approval`, its latest Review id/verdict with the Review's
-findings in a collapsible section, and its recorded Attempt count. A Task
-in `state: approval` whose decision file `.aios/approvals/<task-id>` does
-not yet exist is flagged with the exact path a human must write `approved`
-or `rejected` to. Tasks and Reviews are loaded with the same strict
-validation the Loop Engine uses; a document that fails to load is rendered
-as a visible error card naming the document and reason instead of aborting
-the whole dashboard. A separate Worker Sessions section shows the operational
-ledger's usage and refill information; a missing ledger is an empty state and
-an invalid one is a visible error. The HTML uses inline CSS only and needs no
-JavaScript for its core view.
+The page opens with a plain-language introduction to AIOS and its Task ->
+Review -> Approval loop, then an overview (project, Task counts per state,
+generation time), a "Next actions" section (a plain-language, plain-array
+list of what needs a decision — awaiting approvals, blocked Tasks, pending
+plan adoptions — or an explicit empty state when nothing needs action),
+"Upcoming Tasks" and "Completed Tasks" sections (one card per Task with its
+id, title, a state badge, retry count/limit, `approval`, its latest Review
+id/verdict with the Review's findings in a collapsible section, and its
+recorded Attempt count; the done section is visually distinguished with a
+checkmark label, not color alone), and a "Plan proposals awaiting adoption"
+section listing each not-yet-adopted plan's id, profile, and proposal count.
+A Task in `state: approval` whose decision file `.aios/approvals/<task-id>`
+does not yet exist is flagged with the exact path a human must write
+`approved` or `rejected` to. Tasks, Reviews, and plan documents are loaded
+with the same strict validation the Loop Engine uses; a document that fails
+to load is rendered as a visible error card naming the document and reason
+instead of aborting the whole dashboard. A separate Worker Sessions section
+shows the operational ledger's usage and refill information; a missing
+ledger is an empty state and an invalid one is a visible error. The layout
+uses landmark regions, a correct heading hierarchy, and CSS-only responsive
+collapsing to a single column at narrow widths. The HTML uses inline CSS
+only and needs no JavaScript for its core view.
+
+## Planner
+
+Planner is an upstream convention, not a fourth engine Role and not a
+multi-Task scheduler. A normal planning Task uses its Implementer to turn one
+brief into proposals under `plans/<plan-id>/`; its Reviewer evaluates both the
+mechanical validity and the quality of that decomposition. Workers may write
+the plan directory, but only the operator-invoked engine command below may
+materialize proposals under `.aios/tasks/`.
+
+Every Planner follows the same protocol: preserve the brief, state assumptions
+and risks, select measurable completion evidence, keep each proposal within one
+focused Worker session, and put ordering in the plan rather than adding Task
+dependency fields. A profile supplies domain-specific decomposition and
+verification guidance without granting additional authority:
+
+| Profile | Use it for | Planning emphasis |
+| --- | --- | --- |
+| `generic-goal` | Ambiguous or uncatalogued work | Independently verifiable outcomes; the safe fallback |
+| `software-feature` | New product or code behavior | Contracts, implementation, tests, integration |
+| `bug-fix` | Regressions and defects | Reproduction, root cause, correction, regression coverage |
+| `website` | Multi-page web experiences | Information structure, shared visuals, pages, accessibility |
+| `research` | Evidence-backed investigation | Questions, sources, corroboration, synthesis |
+| `migration` | Data or platform transitions | Preflight, backup, conversion, validation, rollback |
+| `content` | Written deliverables | Audience, outline, draft, fact-checking, editing |
+
+Choose the narrowest profile supported by the brief. When none clearly fits,
+choose `generic-goal` and explain the decomposition rules in the plan. Profile
+selection is reviewable evidence, so `PLAN.md` begins with exact front matter:
+
+```markdown
+---
+schema: aios.plan/v1
+id: public-site
+project: example-project
+profile: website
+profile_reason: The brief requests a responsive multi-page public website.
+---
+
+# Public site plan
+
+## Brief
+
+The original goal and constraints.
+
+## Profile Application
+
+How the selected profile shaped this decomposition.
+
+## Assumptions and Risks
+
+What is assumed, what remains uncertain, and what could invalidate the order.
+
+## Decomposition Rationale
+
+Why these are one-session Tasks and why this order is appropriate.
+
+## Execution Order
+
+1. P-01 establishes the shared foundation.
+2. P-02 delivers the first page.
+```
+
+The same directory contains a contiguous `P-01.md`, `P-02.md`, and so on.
+Each proposal is an ordinary `aios.task/v1` document except that its id is the
+matching placeholder. It starts in `implement`, uses `retry: {count: 0,
+limit: 2}`, has `last_review: null`, and cannot refer to other proposals in its
+body; relationships stay in `PLAN.md`.
+
+The planning Implementer's Verification must run the non-mutating check:
+
+```console
+npm run aios -- adopt plans/public-site --check
+```
+
+After the planning Task passes Review and any required human approval, adopt
+the reviewed plan explicitly:
+
+```console
+npm run aios -- adopt plans/public-site
+```
+
+`adopt` validates the profile evidence, sections, ordered references, and every
+proposal before writing anything. It allocates sequential real Task ids after
+the repository's greatest existing id, creates all Tasks without overwriting
+existing files, rewrites the placeholders in `PLAN.md`, and prints the mapping.
+Validation failure names all detected problems and writes nothing. `--root`
+changes the repository root; the plan must be a direct child of its `plans/`
+directory. Exit codes are 0 for checked/adopted, 1 for plan validation or
+adoption failure, and 64 for command usage errors. Running the adopted Tasks is
+deliberately separate; orchestration remains out of scope.
 
 ## Command Worker
 

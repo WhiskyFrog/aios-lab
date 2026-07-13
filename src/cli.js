@@ -5,6 +5,11 @@ import { fileURLToPath } from "node:url";
 
 import { writeDashboard } from "./dashboard.js";
 import { LoopEngine } from "./engine.js";
+import {
+  adoptPlan,
+  PlanAdoptionError,
+  PlanValidationError,
+} from "./plans.js";
 import { FileAssignmentResolver } from "./workers.js";
 
 function usage() {
@@ -13,6 +18,7 @@ function usage() {
     "  aios run <task-id> [--root <path>] [--assignments <path>] [--timeout-ms <n>]",
     "       [--wait-for-capacity] [--max-capacity-wait-ms <n>] [--max-capacity-pauses <n>]",
     "  aios dashboard [--root <path>] [--out <file>]",
+    "  aios adopt <plan-dir> [--root <path>] [--check]",
     "",
     "The run command runs one Task through each assigned Role until it is",
     "done, blocked, waiting for Worker capacity, or halted by an error.",
@@ -22,8 +28,12 @@ function usage() {
     "repository root); it is a read-only, one-shot pass and never modifies",
     "anything under .aios/.",
     "",
+    "The adopt command validates a reviewed plan and atomically materializes",
+    "its proposals as sequential Tasks. --check performs no writes.",
+    "",
     "Exit codes: run: 0 done, 1 halted, 2 blocked, 64 usage error, 75 waiting.",
     "            dashboard: 0 written, 64 usage error.",
+    "            adopt: 0 checked/adopted, 1 validation failure, 64 usage error.",
   ].join("\n");
 }
 
@@ -106,6 +116,41 @@ function parseDashboardArguments(rest) {
   return options;
 }
 
+function parseAdoptArguments(rest) {
+  if (rest.length < 1 || rest[0].startsWith("--")) {
+    throw new Error(usage());
+  }
+  const options = {
+    help: false,
+    command: "adopt",
+    planArgument: rest[0],
+    planDirectory: null,
+    root: process.cwd(),
+    checkOnly: false,
+  };
+  for (let index = 1; index < rest.length; index += 1) {
+    const flag = rest[index];
+    if (flag === "--check") {
+      options.checkOnly = true;
+      continue;
+    }
+    const value = rest[index + 1];
+    if (!value) {
+      throw new Error(`Missing value for ${flag}`);
+    }
+    if (flag === "--root") {
+      options.root = path.resolve(value);
+    } else {
+      throw new Error(`Unknown option ${flag}`);
+    }
+    index += 1;
+  }
+  options.planDirectory = path.isAbsolute(options.planArgument)
+    ? path.resolve(options.planArgument)
+    : path.resolve(options.root, options.planArgument);
+  return options;
+}
+
 function parseArguments(argv) {
   if (argv.length === 0 || argv.includes("--help") || argv.includes("-h")) {
     return { help: true };
@@ -116,6 +161,9 @@ function parseArguments(argv) {
   }
   if (command === "dashboard") {
     return parseDashboardArguments(rest);
+  }
+  if (command === "adopt") {
+    return parseAdoptArguments(rest);
   }
   throw new Error(usage());
 }
@@ -137,6 +185,24 @@ export async function main(argv = process.argv.slice(2)) {
     const writtenPath = await writeDashboard({ root: options.root, out: options.out });
     console.log(writtenPath);
     return 0;
+  }
+
+  if (options.command === "adopt") {
+    try {
+      const result = await adoptPlan({
+        root: options.root,
+        planDirectory: options.planDirectory,
+        checkOnly: options.checkOnly,
+      });
+      console.log(JSON.stringify(result));
+      return 0;
+    } catch (error) {
+      if (error instanceof PlanValidationError || error instanceof PlanAdoptionError) {
+        console.error(error.message);
+        return 1;
+      }
+      throw error;
+    }
   }
 
   const assignments = new FileAssignmentResolver(options.assignments, {

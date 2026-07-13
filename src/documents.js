@@ -64,7 +64,7 @@ export function parseDocumentFile(raw, label = "Document") {
   };
 }
 
-function renderDocument(metadata, body) {
+export function renderDocument(metadata, body) {
   const yaml = stringify(metadata, { lineWidth: 0 }).trimEnd();
   return `---\n${yaml}\n---\n${body}`;
 }
@@ -80,7 +80,7 @@ function markdownSection(body, heading) {
   return remainder.slice(0, nextHeading?.index ?? remainder.length).trim();
 }
 
-function validateTaskBody(body, taskId) {
+export function validateTaskBody(body, taskId) {
   const objective = markdownSection(body, "Objective");
   if (!objective) {
     throw new StoreError(`Task ${taskId} must contain a non-empty Objective`);

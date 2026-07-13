@@ -2,6 +2,7 @@ import { access, mkdir, readdir } from "node:fs/promises";
 import path from "node:path";
 
 import { atomicReplace, countAttempts, TaskStore } from "./documents.js";
+import { collectPlanProposals, deriveNextActions } from "./plan-dashboard.js";
 import { SessionLedger } from "./sessions.js";
 
 const TASK_FILE = /^(task-[0-9]{4,})\.md$/;
@@ -80,6 +81,9 @@ export async function collectDashboardData(root) {
     });
   }
 
+  const { plans, errors: planErrors } = await collectPlanProposals(root);
+  const nextActions = deriveNextActions({ rows, plans });
+
   return {
     project,
     generatedAt: new Date().toISOString(),
@@ -88,6 +92,9 @@ export async function collectDashboardData(root) {
     errors,
     workerSessions,
     sessionError,
+    plans,
+    planErrors,
+    nextActions,
   };
 }
 
@@ -100,17 +107,52 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
-function renderOverview(data) {
+function renderHeader(data) {
+  return `
+    <header class="page-header">
+      <h1>${escapeHtml(data.project)} — AIOS Loop Dashboard</h1>
+      <p class="generated">Generated ${escapeHtml(data.generatedAt)}</p>
+    </header>`;
+}
+
+function renderIntro() {
+  return `
+    <section class="intro" aria-labelledby="intro-heading">
+      <h2 id="intro-heading">What is AIOS?</h2>
+      <p>
+        AIOS turns a plain-language goal into working software through small,
+        reviewed units of work called Tasks. Nothing merges without evidence
+        that it actually works, and a human stays in control of any Task
+        marked as needing a decision.
+      </p>
+      <h3>The Task &rarr; Review &rarr; Approval loop</h3>
+      <p>Every Task moves through the same three steps:</p>
+      <ol>
+        <li><strong>Implement</strong> &mdash; a Worker makes the change and shows its work.</li>
+        <li><strong>Review</strong> &mdash; a Reviewer checks the result against the Task's
+          acceptance criteria and records a pass or a request for changes.</li>
+        <li><strong>Approval</strong> &mdash; Tasks marked as requiring it wait for a human
+          decision before they are considered done.</li>
+      </ol>
+      <p>
+        A Task that fails review goes back to Implement for another attempt; a
+        Task that exhausts its retry limit is marked blocked for a human to
+        resolve. This page is a generated, read-only snapshot of that loop: it
+        never changes anything on its own.
+      </p>
+    </section>`;
+}
+
+function renderCounts(data) {
   const counts = TASK_STATES.map(
     (state) =>
       `<div class="count"><span class="count-value">${data.stateCounts[state]}</span><span class="count-label badge badge-${state}">${state}</span></div>`,
   ).join("");
   return `
-    <header class="overview">
-      <h1>${escapeHtml(data.project)} — Loop Dashboard</h1>
-      <p class="generated">Generated ${escapeHtml(data.generatedAt)}</p>
+    <section class="counts-section" aria-labelledby="counts-heading">
+      <h2 id="counts-heading">Task snapshot</h2>
       <div class="counts">${counts}</div>
-    </header>`;
+    </section>`;
 }
 
 function renderReview(row) {
@@ -143,7 +185,7 @@ function renderTaskCard(row) {
         <span class="task-id">${escapeHtml(row.id)}</span>
         <span class="badge badge-${row.state}">${escapeHtml(row.state)}</span>
       </div>
-      <h2 class="task-title">${escapeHtml(row.title)}</h2>
+      <h3 class="task-title">${escapeHtml(row.title)}</h3>
       ${awaiting}
       <div class="field">
         <span class="field-label">Retry</span>
@@ -170,6 +212,91 @@ function renderErrorCard(entry) {
       </div>
       <p class="error-message">${escapeHtml(entry.message)}</p>
     </article>`;
+}
+
+function renderTaskSection({ id, heading, rows, emptyMessage, sectionClass }) {
+  const content =
+    rows.length === 0
+      ? `<p class="empty-state">${escapeHtml(emptyMessage)}</p>`
+      : `<div class="grid">${rows.map(renderTaskCard).join("\n")}</div>`;
+  return `
+    <section class="tasks-section ${sectionClass}" aria-labelledby="${id}">
+      <h2 id="${id}">${escapeHtml(heading)}</h2>
+      ${content}
+    </section>`;
+}
+
+function renderUpcomingTasks(data) {
+  const rows = data.rows.filter((row) => row.state !== "done");
+  return renderTaskSection({
+    id: "upcoming-tasks-heading",
+    heading: "Upcoming Tasks",
+    rows,
+    emptyMessage: "No upcoming Tasks. Everything currently tracked is done.",
+    sectionClass: "upcoming-section",
+  });
+}
+
+function renderCompletedTasks(data) {
+  const rows = data.rows.filter((row) => row.state === "done");
+  return renderTaskSection({
+    id: "completed-tasks-heading",
+    heading: "Completed Tasks",
+    rows,
+    emptyMessage: "No Tasks have been completed yet.",
+    sectionClass: "done-section",
+  });
+}
+
+function renderPlanCard(plan) {
+  return `
+    <article class="task-card plan-card">
+      <div class="task-header">
+        <span class="task-id">${escapeHtml(plan.id)}</span>
+        <span class="badge badge-plan">plan</span>
+      </div>
+      <div class="field">
+        <span class="field-label">Profile</span>
+        <span class="field-value">${escapeHtml(plan.profile ?? "Not reported")}</span>
+      </div>
+      <div class="field">
+        <span class="field-label">Proposals</span>
+        <span class="field-value">${plan.proposalCount}</span>
+      </div>
+    </article>`;
+}
+
+function renderPlanProposals(data) {
+  const pending = data.plans.filter((plan) => !plan.adopted);
+  const content =
+    pending.length === 0
+      ? '<p class="empty-state">No plan proposals are waiting for adoption.</p>'
+      : `<div class="grid">${pending.map(renderPlanCard).join("\n")}</div>`;
+  return `
+    <section class="plans-section" aria-labelledby="plans-heading">
+      <h2 id="plans-heading">Plan proposals awaiting adoption</h2>
+      ${content}
+    </section>`;
+}
+
+function renderNextAction(action) {
+  return `
+      <li class="next-action">
+        <span class="badge badge-action">${escapeHtml(action.kind)}</span>
+        <span class="next-action-message">${escapeHtml(action.message)}</span>
+      </li>`;
+}
+
+function renderNextActions(data) {
+  const content =
+    data.nextActions.length === 0
+      ? '<p class="empty-state">Nothing needs action right now.</p>'
+      : `<ul class="next-actions-list">${data.nextActions.map(renderNextAction).join("\n")}</ul>`;
+  return `
+    <section class="next-actions-section" aria-labelledby="next-actions-heading">
+      <h2 id="next-actions-heading">Next actions</h2>
+      ${content}
+    </section>`;
 }
 
 function renderUsage(usage) {
@@ -237,8 +364,8 @@ function renderWorkerSessions(data) {
       )}</div>`
     : "";
   return `
-    <section class="sessions-section">
-      <h2>Worker Sessions</h2>
+    <section class="sessions-section" aria-labelledby="sessions-heading">
+      <h2 id="sessions-heading">Worker Sessions</h2>
       ${error}
       ${body}
     </section>`;
@@ -254,9 +381,28 @@ const STYLE = `
     background: #f4f5f7;
     color: #1c2127;
   }
+  .skip-link {
+    position: absolute;
+    left: -9999px;
+    top: 0;
+    background: #fff;
+    color: #1c2127;
+    padding: 0.5rem 1rem;
+    border-radius: 0 0 6px 0;
+    z-index: 10;
+  }
+  .skip-link:focus { left: 0; }
   h1 { margin: 0 0 0.25rem; font-size: 1.5rem; }
+  h2 { font-size: 1.2rem; }
+  h3 { font-size: 1.05rem; }
+  .page-header { margin-bottom: 1.5rem; }
+  main { display: flex; flex-direction: column; gap: 2rem; }
+  main > section { border-top: 1px solid #cbd1d9; padding-top: 1.5rem; }
+  main > section:first-child { border-top: none; padding-top: 0; }
+  .intro p, .intro li { line-height: 1.5; }
+  .intro ol { padding-left: 1.25rem; }
   .generated { margin: 0 0 1rem; color: #5b6472; font-size: 0.85rem; }
-  .counts { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.5rem; }
+  .counts { display: flex; gap: 1rem; flex-wrap: wrap; }
   .count { display: flex; flex-direction: column; align-items: center; gap: 0.25rem; }
   .count-value { font-size: 1.5rem; font-weight: 600; }
   .grid {
@@ -289,10 +435,12 @@ const STYLE = `
   }
   .badge-implement { background: #2f6fed; }
   .badge-review { background: #7c3fed; }
-  .badge-approval { background: #d97706; }
-  .badge-done { background: #1a9e5c; }
+  .badge-approval { background: #b45309; }
+  .badge-done { background: #15803d; }
   .badge-blocked { background: #d63939; }
   .badge-error { background: #6b7280; }
+  .badge-plan { background: #46515f; }
+  .badge-action { background: #2f6fed; }
   .field { display: flex; justify-content: space-between; font-size: 0.9rem; margin: 0.25rem 0; }
   .field-label { color: #5b6472; }
   .awaiting-approval {
@@ -308,8 +456,30 @@ const STYLE = `
   details p { white-space: pre-wrap; margin: 0.5rem 0 0; }
   .error-card { border-color: #d63939; }
   .error-message { font-size: 0.85rem; white-space: pre-wrap; margin: 0; }
-  .errors-section { margin-top: 2rem; }
-  .sessions-section { margin-top: 2rem; border-top: 1px solid #cbd1d9; padding-top: 1.5rem; }
+  .done-section .task-card {
+    background: #f0f5f2;
+    border-color: #bfd8c9;
+  }
+  .done-section .task-card::before {
+    content: "\\2713\\0020Done";
+    display: inline-block;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #15803d;
+    margin-bottom: 0.5rem;
+  }
+  .plan-card { border-color: #cfd6df; }
+  .next-actions-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
+  .next-action {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    background: #fff;
+    border: 1px solid #dde1e7;
+    border-radius: 6px;
+    padding: 0.6rem 0.85rem;
+    font-size: 0.9rem;
+  }
   .sessions-section h2 { margin: 0 0 1rem; font-size: 1.2rem; }
   .session-grid {
     display: grid;
@@ -331,30 +501,50 @@ const STYLE = `
     margin-bottom: 1rem;
     border-radius: 6px;
   }
+  @media (max-width: 480px) {
+    body { padding: 1rem; }
+    .counts { gap: 0.75rem; }
+    .task-header { flex-wrap: wrap; row-gap: 0.35rem; }
+  }
 `;
 
+function renderErrors(data) {
+  const documentErrors = [
+    ...data.errors.map((entry) => ({ id: entry.id, message: entry.message })),
+    ...data.planErrors.map((entry) => ({ id: entry.plan, message: entry.message })),
+  ];
+  if (documentErrors.length === 0) {
+    return "";
+  }
+  return `
+    <section class="errors-section" aria-labelledby="errors-heading">
+      <h2 id="errors-heading">Documents that failed to load</h2>
+      <div class="grid">${documentErrors.map(renderErrorCard).join("\n")}</div>
+    </section>`;
+}
+
 export function renderDashboard(data) {
-  const cards = data.rows.map(renderTaskCard).join("\n");
-  const errorCards =
-    data.errors.length > 0
-      ? `<section class="errors-section"><h2>Documents that failed to load</h2><div class="grid">${data.errors
-          .map(renderErrorCard)
-          .join("\n")}</div></section>`
-      : "";
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>${escapeHtml(data.project)} — Loop Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(data.project)} — AIOS Loop Dashboard</title>
 <style>${STYLE}</style>
 </head>
 <body>
-${renderOverview(data)}
-<main class="grid">
-${cards}
-</main>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+${renderHeader(data)}
+<main id="main-content">
+${renderIntro()}
+${renderCounts(data)}
+${renderNextActions(data)}
+${renderUpcomingTasks(data)}
+${renderCompletedTasks(data)}
+${renderPlanProposals(data)}
+${renderErrors(data)}
 ${renderWorkerSessions(data)}
-${errorCards}
+</main>
 </body>
 </html>
 `;

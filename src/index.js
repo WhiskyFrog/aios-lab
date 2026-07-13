@@ -1,6 +1,14 @@
 export { LoopEngine } from "./engine.js";
 export { TaskStore } from "./documents.js";
 export {
+  adoptPlan,
+  allocateTaskIds,
+  inspectPlan,
+  PLANNER_PROFILES,
+  PlanAdoptionError,
+  PlanValidationError,
+} from "./plans.js";
+export {
   CapacityDeferredError,
   CommandWorker,
   FileAssignmentResolver,

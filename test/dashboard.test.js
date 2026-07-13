@@ -248,6 +248,266 @@ test("dashboard shows an invalid session ledger as a visible error", async (t) =
   assert.match(renderDashboard(data), /Session ledger error/);
 });
 
+function planDocument({ id, profile = "website", proposalId = "P-01", adopted = false }) {
+  const executionReference = adopted ? "task-9999" : proposalId;
+  return [
+    "---",
+    "schema: aios.plan/v1",
+    `id: ${id}`,
+    "project: dash-project",
+    `profile: ${profile}`,
+    "profile_reason: Exercise the dashboard plan-proposals section.",
+    "---",
+    "",
+    "# Demo plan",
+    "",
+    "## Brief",
+    "",
+    "Build a small responsive website.",
+    "",
+    "## Execution Order",
+    "",
+    `1. ${executionReference} is the next outcome.`,
+    "",
+  ].join("\n");
+}
+
+async function makePlan(root, name, options = {}) {
+  const planDirectory = path.join(root, "plans", name);
+  await mkdir(planDirectory, { recursive: true });
+  await writeFile(
+    path.join(planDirectory, "PLAN.md"),
+    planDocument({ id: name, ...options }),
+    "utf8",
+  );
+  await writeFile(path.join(planDirectory, "P-01.md"), "placeholder proposal", "utf8");
+  return planDirectory;
+}
+
+test("renderDashboard opens with a plain-language AIOS introduction and Task/Review/Approval workflow", async (t) => {
+  const root = await makeRoot(t);
+  const data = await collectDashboardData(root);
+  const html = renderDashboard(data);
+
+  assert.match(html, /What is AIOS\?/);
+  assert.match(html, /Task/);
+  assert.match(html, /Review/);
+  assert.match(html, /Approval/);
+  assert.ok(
+    html.indexOf("What is AIOS?") < html.indexOf("Task snapshot"),
+    "intro must appear before the Task lifecycle data",
+  );
+});
+
+test("renderDashboard visually separates upcoming Tasks from completed Tasks", async (t) => {
+  const root = await makeRoot(t);
+  await writeFile(
+    path.join(root, ".aios", "tasks", "task-0001.md"),
+    taskDocument({
+      schema: "aios.task/v1",
+      id: "task-0001",
+      project: "dash-project",
+      title: "Upcoming work",
+      state: "implement",
+      retry: { count: 0, limit: 2 },
+      approval: "not_required",
+      last_review: null,
+    }),
+    "utf8",
+  );
+  await writeFile(
+    path.join(root, ".aios", "reviews", "review-0002.md"),
+    reviewDocument({
+      schema: "aios.review/v1",
+      id: "review-0002",
+      project: "dash-project",
+      task: "task-0002",
+      attempt: 1,
+      verdict: "pass",
+    }),
+    "utf8",
+  );
+  await writeFile(
+    path.join(root, ".aios", "tasks", "task-0002.md"),
+    taskDocument(
+      {
+        schema: "aios.task/v1",
+        id: "task-0002",
+        project: "dash-project",
+        title: "Finished work",
+        state: "done",
+        retry: { count: 0, limit: 2 },
+        approval: "not_required",
+        last_review: "review-0002",
+      },
+      [
+        "<!-- aios:attempt-frame v1 number=1 summary=4 verification=4 -->",
+        "### Attempt 1",
+        "",
+        "#### Summary",
+        "",
+        "done",
+        "",
+        "#### Verification",
+        "",
+        "done",
+        "<!-- /aios:attempt-frame v1 number=1 -->",
+      ].join("\n"),
+    ),
+    "utf8",
+  );
+
+  const data = await collectDashboardData(root);
+  const html = renderDashboard(data);
+
+  const upcomingSection = /<section class="tasks-section upcoming-section"[\s\S]*?<\/section>/.exec(
+    html,
+  )[0];
+  const doneSection = /<section class="tasks-section done-section"[\s\S]*?<\/section>/.exec(
+    html,
+  )[0];
+
+  assert.match(upcomingSection, /Upcoming Tasks/);
+  assert.match(upcomingSection, /task-0001/);
+  assert.doesNotMatch(upcomingSection, /task-0002/);
+
+  assert.match(doneSection, /Completed Tasks/);
+  assert.match(doneSection, /task-0002/);
+  assert.doesNotMatch(doneSection, /task-0001/);
+});
+
+test("renderDashboard lists not-yet-adopted plan proposals separately from adopted ones", async (t) => {
+  const root = await makeRoot(t);
+  await makePlan(root, "pending-plan", { profile: "website", adopted: false });
+  await makePlan(root, "adopted-plan", { profile: "bug-fix", adopted: true });
+
+  const data = await collectDashboardData(root);
+  const html = renderDashboard(data);
+
+  const plansSection = /<section class="plans-section"[\s\S]*?<\/section>/.exec(html)[0];
+  assert.match(plansSection, /Plan proposals awaiting adoption/);
+  assert.match(plansSection, /pending-plan/);
+  assert.match(plansSection, /website/);
+  assert.match(plansSection, />1</);
+  assert.doesNotMatch(plansSection, /adopted-plan/);
+});
+
+test("renderDashboard shows an empty state when no plan proposals are pending", async (t) => {
+  const root = await makeRoot(t);
+  const data = await collectDashboardData(root);
+  const html = renderDashboard(data);
+
+  assert.match(html, /No plan proposals are waiting for adoption\./);
+});
+
+test("renderDashboard shows an unparsable PLAN.md as a visible named error, not an aborted page", async (t) => {
+  const root = await makeRoot(t);
+  const brokenDirectory = path.join(root, "plans", "broken-plan");
+  await mkdir(brokenDirectory, { recursive: true });
+  await writeFile(path.join(brokenDirectory, "PLAN.md"), "not a document at all", "utf8");
+  await writeFile(path.join(brokenDirectory, "P-01.md"), "placeholder", "utf8");
+
+  const data = await collectDashboardData(root);
+  assert.equal(data.planErrors.length, 1);
+  const html = renderDashboard(data);
+
+  assert.match(html, /Documents that failed to load/);
+  assert.match(html, /broken-plan/);
+});
+
+test("renderDashboard lists plain-language next actions, or an explicit empty state", async (t) => {
+  const root = await makeRoot(t);
+  await writeFile(
+    path.join(root, ".aios", "reviews", "review-0001.md"),
+    reviewDocument({
+      schema: "aios.review/v1",
+      id: "review-0001",
+      project: "dash-project",
+      task: "task-0001",
+      attempt: 1,
+      verdict: "pass",
+    }),
+    "utf8",
+  );
+  await writeFile(
+    path.join(root, ".aios", "tasks", "task-0001.md"),
+    taskDocument(
+      {
+        schema: "aios.task/v1",
+        id: "task-0001",
+        project: "dash-project",
+        title: "Awaiting a human decision",
+        state: "approval",
+        retry: { count: 0, limit: 2 },
+        approval: "required",
+        last_review: "review-0001",
+      },
+      [
+        "<!-- aios:attempt-frame v1 number=1 summary=4 verification=4 -->",
+        "### Attempt 1",
+        "",
+        "#### Summary",
+        "",
+        "done",
+        "",
+        "#### Verification",
+        "",
+        "done",
+        "<!-- /aios:attempt-frame v1 number=1 -->",
+      ].join("\n"),
+    ),
+    "utf8",
+  );
+
+  const withAction = await collectDashboardData(root);
+  const htmlWithAction = renderDashboard(withAction);
+  assert.match(htmlWithAction, /Next actions/);
+  assert.match(htmlWithAction, /Approve or reject task-0001/);
+
+  await rm(path.join(root, ".aios", "tasks", "task-0001.md"));
+  const withoutAction = await collectDashboardData(root);
+  const htmlWithoutAction = renderDashboard(withoutAction);
+  assert.match(htmlWithoutAction, /Nothing needs action right now\./);
+});
+
+test("renderDashboard uses a single h1 and gives every landmark section an accessible heading", async (t) => {
+  const root = await makeRoot(t);
+  await makePlan(root, "pending-plan", { profile: "website", adopted: false });
+  await writeFile(
+    path.join(root, ".aios", "tasks", "task-0001.md"),
+    taskDocument({
+      schema: "aios.task/v1",
+      id: "task-0001",
+      project: "dash-project",
+      title: "Upcoming work",
+      state: "implement",
+      retry: { count: 0, limit: 2 },
+      approval: "not_required",
+      last_review: null,
+    }),
+    "utf8",
+  );
+
+  const data = await collectDashboardData(root);
+  const html = renderDashboard(data);
+
+  const h1Count = (html.match(/<h1[ >]/g) ?? []).length;
+  assert.equal(h1Count, 1, "the page must have exactly one top-level heading");
+
+  assert.match(html, /<main id="main-content">/);
+
+  const headingIds = new Set((html.match(/<h[1-6] id="([^"]+)"/g) ?? []).map((tag) => tag.match(/id="([^"]+)"/)[1]));
+  const labelledSections = html.match(/<section[^>]*aria-labelledby="([^"]+)"/g) ?? [];
+  assert.ok(labelledSections.length >= 5, "every content section should be a labelled landmark");
+  for (const section of labelledSections) {
+    const referencedId = section.match(/aria-labelledby="([^"]+)"/)[1];
+    assert.ok(
+      headingIds.has(referencedId),
+      `section aria-labelledby="${referencedId}" must reference a real heading id`,
+    );
+  }
+});
+
 test("writeDashboard writes a file and returns its path", async (t) => {
   const root = await makeRoot(t);
   await writeFile(
