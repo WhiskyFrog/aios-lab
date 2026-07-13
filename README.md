@@ -71,12 +71,12 @@ malformed output, and ordinary Result failures still halt for operator
 inspection. Token counts are telemetry only and are never used to guess a
 refill time.
 
-Structured Claude runs are recorded in the git-ignored
+Structured Claude and Codex runs are recorded in the git-ignored
 `.aios/runtime/sessions.json`. This atomic operational ledger keeps one row per
 provider session with Task, Role, model, invocation count, token usage, cost,
-latest capacity utilization, and reset time when Claude supplies them. Usage
-and cost are accumulated across resumed invocations of the same session. The
-ledger is not Task lifecycle truth and can be deleted without changing any
+latest capacity utilization, and reset time when a provider supplies them.
+Usage and cost are accumulated across resumed invocations of the same session.
+The ledger is not Task lifecycle truth and can be deleted without changing any
 Task.
 
 ## Dashboard
@@ -193,10 +193,8 @@ through Assignment configuration alone: both adapters use the same Role
 prompts, the same reply extraction and payload validation (shared in
 `workers/worker-shared.mjs`), and the same failure discipline. It follows the
 command Worker contract: Task document on stdin, `AIOS_ROLE`/`AIOS_TASK_ID`
-in the environment, one `aios.result/v1` object on stdout. Codex has no
-capacity-deferral signal in scope here, so the adapter always emits a bare
-Result — never the `aios.worker-execution/v1` transport envelope — which
-`CommandWorker` accepts unchanged.
+in the environment, and one `aios.worker-execution/v1` transport object on
+stdout containing the Result plus session telemetry.
 
 ```json
 {
@@ -220,17 +218,43 @@ plus the portable `cli.js` — exactly as with the `.cmd`/`.ps1` caveat
 documented above for other command Workers.
 
 Sandbox mapping: each Role action launches exactly one `codex exec` session
-with `--sandbox workspace-write` for the Implementer (the one Role meant to
-change the repository) and `--sandbox read-only` for the Reviewer and
-Approver. The `--dangerously-*` bypass flags are never used.
+with `--json` and `--sandbox workspace-write` for the Implementer (the one Role
+meant to change the repository) or `--sandbox read-only` for the Reviewer and
+Approver. The `--dangerously-*` bypass flags are never used. On a continuation
+the adapter runs `codex exec ... resume <thread-id> <prompt>` and requires the
+resumed `thread.started.thread_id` to equal that exact id.
 
 The reply is read deterministically from a temporary
 `--output-last-message` file, which is removed after each session regardless
 of outcome. A valid role payload becomes a `status: success` Result, a
-`{"failure_reason": "..."}` reply becomes a `status: failure` Result, and
-anything unusable — an unparseable or invalid reply, a missing final-message
-file, or a nonzero `codex exec` exit — makes the adapter exit nonzero with no
-stdout, so the engine halts without a Task transition.
+`{"failure_reason": "..."}` reply becomes a `status: failure` Result, and a
+parseable Codex session failure becomes an ordinary failure Result so its
+thread and usage telemetry are still recorded. Malformed JSONL or a stream
+without a thread id makes the adapter exit nonzero with no stdout.
+
+Capacity investigation (Codex CLI 0.144.3): `codex exec --json` exposes the
+resumable id in `thread.started.thread_id` and token counts in
+`turn.completed.usage`, but its public event schema has no reset-time or
+rate-limit field. A real usage-limit trace captured in
+`fixtures/codex-usage-limit.ndjson` contains only `error.message` and
+`turn.failed.error.message`; the apparent reset time is human prose. The
+fixture source is this [published raw Codex execution
+trace](https://gist.github.com/konard/4b15728ce4ff3cddb6ea482a43e32c4c),
+and the absence of capacity fields agrees with the [Codex exec event
+schema](https://github.com/openai/codex/blob/main/codex-rs/exec/src/exec_events.rs).
+On a failed turn, the adapter now starts the same Codex launcher's official
+app-server transport and asks for two independent structured records:
+`thread/resume` must report `codexErrorInfo: "usageLimitExceeded"` for the
+exact failed thread, and `account/rateLimits/read` must report a rejected,
+exhausted Codex rate window with a future Unix `resetsAt`. If multiple windows
+are exhausted, AIOS waits for the latest reset. Only that corroborated case
+becomes a capacity deferral using the exact thread id as its continuation.
+
+The adapter still never parses error prose, token counts, local rollout files,
+or hard-coded quota windows to invent `retry_at`. Missing app-server support,
+an unreadable thread, a stale or absent reset, credit-only exhaustion, and all
+non-usage errors remain ordinary failures for operator inspection. Claude's
+structured deferral behavior is unchanged.
 
 Mixed-vendor example — bind different Roles to different providers in one
 Assignment file:
