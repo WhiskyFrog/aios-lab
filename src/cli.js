@@ -10,18 +10,38 @@ import {
   PlanAdoptionError,
   PlanValidationError,
 } from "./plans.js";
+import { runProgression, STOP_REASONS } from "./progression.js";
 import { FileAssignmentResolver } from "./workers.js";
+
+const PROGRESS_EXIT_CODES = Object.freeze({
+  [STOP_REASONS.PLAN_COMPLETE]: 0,
+  [STOP_REASONS.AWAITING_APPROVAL]: 3,
+  [STOP_REASONS.BLOCKED_REJECTED]: 4,
+  [STOP_REASONS.BLOCKED_RETRY_EXHAUSTED]: 4,
+  [STOP_REASONS.CAPACITY_WAIT]: 5,
+  [STOP_REASONS.CANCELLED]: 6,
+  [STOP_REASONS.WORKER_FAILURE]: 7,
+  [STOP_REASONS.INVALID_DOCUMENT]: 7,
+  [STOP_REASONS.CONFLICT]: 7,
+});
 
 function usage() {
   return [
     "Usage:",
     "  aios run <task-id> [--root <path>] [--assignments <path>] [--timeout-ms <n>]",
     "       [--wait-for-capacity] [--max-capacity-wait-ms <n>] [--max-capacity-pauses <n>]",
+    "  aios progress <plan-dir> [--root <path>] [--assignments <path>] [--timeout-ms <n>]",
+    "       [--wait-for-capacity] [--max-capacity-wait-ms <n>] [--max-capacity-pauses <n>]",
     "  aios dashboard [--root <path>] [--out <file>]",
     "  aios adopt <plan-dir> [--root <path>] [--check]",
     "",
     "The run command runs one Task through each assigned Role until it is",
     "done, blocked, waiting for Worker capacity, or halted by an error.",
+    "",
+    "The progress command drives an adopted plan's Tasks forward in Execution",
+    "Order, running each one through the same loop as run, until every Task",
+    "is done or one of them stops for a human; it reports the completed",
+    "Tasks, the stop reason, and the exact operator action to take next.",
     "",
     "The dashboard command generates a self-contained HTML overview of every",
     "Task's lifecycle position and evidence (default dashboard.html at the",
@@ -32,27 +52,17 @@ function usage() {
     "its proposals as sequential Tasks. --check performs no writes.",
     "",
     "Exit codes: run: 0 done, 1 halted, 2 blocked, 64 usage error, 75 waiting.",
+    "            progress: 0 plan complete, 3 awaiting approval, 4 blocked,",
+    "                      5 capacity wait, 6 cancelled, 7 halted, 64 usage error.",
     "            dashboard: 0 written, 64 usage error.",
     "            adopt: 0 checked/adopted, 1 validation failure, 64 usage error.",
   ].join("\n");
 }
 
-function parseRunArguments(rest) {
-  if (rest.length < 1) {
-    throw new Error(usage());
-  }
-  const options = {
-    help: false,
-    command: "run",
-    taskId: rest[0],
-    root: process.cwd(),
-    assignments: null,
-    timeoutMs: 300_000,
-    waitForCapacity: false,
-    maxCapacityWaitMs: 604_800_000,
-    maxCapacityPauses: 8,
-  };
-  for (let index = 1; index < rest.length; index += 1) {
+// Applies the engine option flags run and progress share, with identical
+// defaults, validation, and error messages for both subcommands.
+function parseEngineOptions(rest, options) {
+  for (let index = 0; index < rest.length; index += 1) {
     const flag = rest[index];
     if (flag === "--wait-for-capacity") {
       options.waitForCapacity = true;
@@ -87,6 +97,42 @@ function parseRunArguments(rest) {
     index += 1;
   }
   options.assignments ??= path.join(options.root, ".aios", "assignments.json");
+  return options;
+}
+
+function engineOptionDefaults(command) {
+  return {
+    help: false,
+    command,
+    root: process.cwd(),
+    assignments: null,
+    timeoutMs: 300_000,
+    waitForCapacity: false,
+    maxCapacityWaitMs: 604_800_000,
+    maxCapacityPauses: 8,
+  };
+}
+
+function parseRunArguments(rest) {
+  if (rest.length < 1) {
+    throw new Error(usage());
+  }
+  const options = { ...engineOptionDefaults("run"), taskId: rest[0] };
+  return parseEngineOptions(rest.slice(1), options);
+}
+
+function parseProgressArguments(rest) {
+  if (rest.length < 1 || rest[0].startsWith("--")) {
+    throw new Error(usage());
+  }
+  const options = parseEngineOptions(rest.slice(1), {
+    ...engineOptionDefaults("progress"),
+    planArgument: rest[0],
+    planDirectory: null,
+  });
+  options.planDirectory = path.isAbsolute(options.planArgument)
+    ? path.resolve(options.planArgument)
+    : path.resolve(options.root, options.planArgument);
   return options;
 }
 
@@ -159,6 +205,9 @@ function parseArguments(argv) {
   if (command === "run") {
     return parseRunArguments(rest);
   }
+  if (command === "progress") {
+    return parseProgressArguments(rest);
+  }
   if (command === "dashboard") {
     return parseDashboardArguments(rest);
   }
@@ -203,6 +252,46 @@ export async function main(argv = process.argv.slice(2)) {
       }
       throw error;
     }
+  }
+
+  if (options.command === "progress") {
+    const assignments = new FileAssignmentResolver(options.assignments, {
+      cwd: options.root,
+      timeoutMs: options.timeoutMs,
+    });
+    const engine = new LoopEngine({ root: options.root, assignments });
+    const controller = new AbortController();
+    const cancel = () => controller.abort();
+    process.once("SIGINT", cancel);
+    process.once("SIGTERM", cancel);
+    let outcome;
+    try {
+      outcome = await runProgression({
+        root: options.root,
+        planDirectory: options.planDirectory,
+        engine,
+        runOptions: {
+          waitForCapacity: options.waitForCapacity,
+          maxCapacityWaitMs: options.maxCapacityWaitMs,
+          maxCapacityPauses: options.maxCapacityPauses,
+          signal: controller.signal,
+        },
+      });
+    } finally {
+      process.removeListener("SIGINT", cancel);
+      process.removeListener("SIGTERM", cancel);
+    }
+    console.log(
+      JSON.stringify({
+        plan: outcome.plan,
+        completed: outcome.completed,
+        complete: outcome.stopReason === STOP_REASONS.PLAN_COMPLETE,
+        task: outcome.task,
+        stop_reason: outcome.stopReason,
+        action: outcome.action,
+      }),
+    );
+    return PROGRESS_EXIT_CODES[outcome.stopReason];
   }
 
   const assignments = new FileAssignmentResolver(options.assignments, {

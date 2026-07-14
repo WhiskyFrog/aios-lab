@@ -262,6 +262,16 @@ export async function runProgression({ root, planDirectory, engine, runOptions =
 
   while (index < order.length) {
     const taskId = order[index];
+    // A signal can become aborted after one Task reaches done but before the
+    // next iteration starts. Stop at that Task boundary so an already-aborted
+    // progression never dispatches another Worker.
+    if (runOptions.signal?.aborted === true) {
+      return stopFor(resolvedRoot, plan, completed, taskId, {
+        kind: "halted",
+        category: "cancelled",
+        reason: "Progression was cancelled before the next Task started",
+      });
+    }
     const outcome = await engine.run(taskId, runOptions);
     if (outcome.kind === "done") {
       completed.push(taskId);
