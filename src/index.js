@@ -18,6 +18,17 @@ export {
 } from "./workers.js";
 export { SessionLedger } from "./sessions.js";
 export {
+  inspectTarget,
+  MAX_DERIVED_PLAN_ID_LENGTH,
+  MAX_OBJECTIVE_BYTES,
+  resolvePlanId,
+  resolveProjectId,
+  TARGET_ERROR_CATEGORIES,
+  TARGET_STATUSES,
+  TargetContractError,
+  validateObjective,
+} from "./targets.js";
+export {
   buildWorkloadContext,
   isSafeModelIdentifier,
   loadExecutionConfig,

@@ -26,6 +26,8 @@ const STATE_ROLES = Object.freeze({
   approval: "approver",
 });
 
+export const PROJECT_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+
 export class ContractError extends Error {
   constructor(message) {
     super(message);
@@ -108,7 +110,7 @@ export function validateTaskMetadata(
   requirePattern(value.id, idPattern, "Task id");
   requirePattern(
     value.project,
-    /^[a-z0-9][a-z0-9-]*$/,
+    PROJECT_ID_PATTERN,
     "Task project",
   );
   requireNonEmptyString(value.title, "Task title");
@@ -180,7 +182,7 @@ export function validateReviewMetadata(value, filenameId = null) {
   if (isBootstrap && value.id !== "review-0001") {
     throw new ContractError("Only review-0001 may use aios.review/v0");
   }
-  requirePattern(value.project, /^[a-z0-9][a-z0-9-]*$/, "Review project");
+  requirePattern(value.project, PROJECT_ID_PATTERN, "Review project");
   requirePattern(value.task, /^task-[0-9]{4,}$/, "Review task");
   if (!Number.isInteger(value.attempt) || value.attempt < 1) {
     throw new ContractError("Review attempt must be an integer >= 1");

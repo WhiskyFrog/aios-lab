@@ -1,7 +1,7 @@
 import { mkdir, readFile, readdir, unlink } from "node:fs/promises";
 import path from "node:path";
 
-import { validateTaskMetadata } from "./contracts.js";
+import { PROJECT_ID_PATTERN, validateTaskMetadata } from "./contracts.js";
 import {
   atomicReplace,
   countAttempts,
@@ -12,8 +12,7 @@ import {
 } from "./documents.js";
 
 const PLAN_SCHEMA = "aios.plan/v1";
-const PLAN_ID = /^[a-z0-9][a-z0-9-]*$/;
-const PROJECT_ID = /^[a-z0-9][a-z0-9-]*$/;
+export const PLAN_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 const PROPOSAL_ID = /^P-([0-9]{2,})$/;
 const TASK_FILE = /^task-([0-9]{4,})\.md$/;
 
@@ -109,14 +108,14 @@ export function validatePlanMetadata(metadata, directoryName, problems) {
     problems.push(`PLAN.md schema must be ${PLAN_SCHEMA}`);
     valid = false;
   }
-  if (typeof metadata.id !== "string" || !PLAN_ID.test(metadata.id)) {
+  if (typeof metadata.id !== "string" || !PLAN_ID_PATTERN.test(metadata.id)) {
     problems.push("PLAN.md id must be a lowercase kebab-case identifier");
     valid = false;
   } else if (metadata.id !== directoryName) {
     problems.push("PLAN.md id must equal its plan directory name");
     valid = false;
   }
-  if (typeof metadata.project !== "string" || !PROJECT_ID.test(metadata.project)) {
+  if (typeof metadata.project !== "string" || !PROJECT_ID_PATTERN.test(metadata.project)) {
     problems.push("PLAN.md project must be a lowercase kebab-case identifier");
     valid = false;
   }
