@@ -2,6 +2,7 @@ import { mkdir, open, readFile, unlink } from "node:fs/promises";
 import path from "node:path";
 
 import { atomicReplace } from "./documents.js";
+import { isSafeModelIdentifier } from "./routing.js";
 import {
   decisionKeyString,
   SELECTION_REASON_CODES,
@@ -49,7 +50,6 @@ const SOURCE_LABEL_LIMIT = 120;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 
 const IDENTIFIER = /^[a-z0-9][a-z0-9._-]*$/;
-const MODEL_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$/;
 const TASK_ID = /^task-[0-9]{4,}$/;
 const ROUTED_ROLES = new Set(["implementer", "reviewer"]);
 const WORK_KINDS = new Set(["planning", "implementation", "unknown"]);
@@ -157,8 +157,8 @@ function nonEmptyString(value, label) {
 }
 
 function modelIdentifier(value, label) {
-  if (typeof value !== "string" || !MODEL_IDENTIFIER.test(value)) {
-    fail(label, "must be a bounded provider model identifier");
+  if (!isSafeModelIdentifier(value)) {
+    fail(label, "must be a bounded, credential-safe provider model identifier");
   }
   return value;
 }
@@ -308,6 +308,7 @@ function validateWorkloadSummary(value, label) {
       "minimum_tier",
       "lower_tier",
       "sources",
+      "diagnostics",
     ],
     label,
   );
@@ -387,6 +388,17 @@ function validateWorkloadSummary(value, label) {
   ) {
     fail(`${label}.lower_tier`, "eligible must match an empty rejection list");
   }
+  exactKeys(
+    value.diagnostics,
+    ["strict_planning_contract", "plan_errors", "history_errors"],
+    `${label}.diagnostics`,
+  );
+  booleanValue(
+    value.diagnostics.strict_planning_contract,
+    `${label}.diagnostics.strict_planning_contract`,
+  );
+  nonNegativeInteger(value.diagnostics.plan_errors, `${label}.diagnostics.plan_errors`);
+  nonNegativeInteger(value.diagnostics.history_errors, `${label}.diagnostics.history_errors`);
   exactKeys(value.sources, WORKLOAD_SOURCE_KEYS, `${label}.sources`);
   for (const [name, source] of Object.entries(value.sources)) {
     boundedLabel(source, `${label}.sources.${name}`, SOURCE_LABEL_LIMIT);
@@ -405,6 +417,38 @@ function validateWorkloadSummary(value, label) {
         fail(`${label}.sources.${name}`, "does not identify the workload parent plan");
       }
     }
+  }
+
+  const expectedRejections = [];
+  if (value.role !== "implementer") expectedRejections.push("role_not_implementer");
+  if (value.work_kind !== "implementation") {
+    expectedRejections.push("work_not_bounded_implementation");
+  }
+  if (value.complexity !== "low") expectedRejections.push("complexity_not_low");
+  if (value.risk !== "low") expectedRejections.push("risk_not_low");
+  if (value.context_band === "large") expectedRejections.push("context_not_bounded");
+  if (!HINT_SOURCE.test(value.sources.required_capabilities)) {
+    expectedRejections.push("capabilities_not_explicit");
+  }
+  if (value.verification !== "objective") {
+    expectedRejections.push("verification_not_objective");
+  }
+  if (
+    value.retry.count > 0 ||
+    value.history.changes_requested > 0 ||
+    value.history.sessions_failed > 0 ||
+    value.diagnostics.history_errors > 0
+  ) {
+    expectedRejections.push("unresolved_failure_history");
+  }
+  if (value.uncertainty_flags.some((flag) => flag !== "parent_plan_missing")) {
+    expectedRejections.push("safety_evidence_uncertain");
+  }
+  if (
+    JSON.stringify(value.lower_tier.rejection_reasons) !==
+    JSON.stringify(expectedRejections)
+  ) {
+    fail(`${label}.lower_tier.rejection_reasons`, "does not match normalized evidence");
   }
 }
 
@@ -522,6 +566,13 @@ function expectedDeficit(observed, count, weight, totalWeight) {
       BigInt(count) * totalWeight.numerator * weight.denominator,
     weight.denominator * totalWeight.numerator,
   );
+}
+
+function compareStoredFractions(left, right) {
+  const difference =
+    BigInt(left.numerator) * BigInt(right.denominator) -
+    BigInt(right.numerator) * BigInt(left.denominator);
+  return difference < 0n ? -1 : difference > 0n ? 1 : 0;
 }
 
 function validateDistribution(value, label) {
@@ -741,6 +792,21 @@ export function validateDecisionRecord(value, label = "Routing decision") {
   if (JSON.stringify(equivalentProviders) !== JSON.stringify(deficitProviders)) {
     fail(`${label}.distribution.deficits`, "must match the equivalent candidate providers");
   }
+  let greatestDeficit = value.distribution.deficits[0];
+  for (const deficit of value.distribution.deficits.slice(1)) {
+    if (compareStoredFractions(deficit, greatestDeficit) > 0) {
+      greatestDeficit = deficit;
+    }
+  }
+  const expectedWinner = equivalentEntries.find(
+    ({ provider }) => provider === greatestDeficit.provider,
+  );
+  if (value.chosen.candidate !== expectedWinner.candidate) {
+    fail(
+      `${label}.chosen.candidate`,
+      "must be the stable candidate-id winner for the greatest provider deficit",
+    );
+  }
   const expectedChanged = value.chosen.candidate !== value.distribution.equivalent[0];
   if (value.distribution.changed_winner !== expectedChanged) {
     fail(`${label}.distribution.changed_winner`, "must identify a change from the fitness winner");
@@ -859,6 +925,30 @@ function validateLedger(value) {
     const keyString = decisionKeyString(record.key);
     const partialKey = `${record.key.task}:${record.key.role}:${record.key.attempt}`;
     const existing = stepsByKey.get(partialKey);
+    if (index > 0 && record.recorded_at < decisions[index - 1].recorded_at) {
+      fail(`Routing decision ${index}.recorded_at`, "must preserve append chronology");
+    }
+    const windowRows = decisions.slice(
+      Math.max(0, index - record.distribution.window),
+      index,
+    );
+    if (record.distribution.observed !== windowRows.length) {
+      fail(
+        `Routing decision ${index}.distribution.observed`,
+        "must equal the actual preceding ledger window",
+      );
+    }
+    for (const count of record.distribution.counts) {
+      const expectedCount = windowRows.filter(
+        (entry) => entry.chosen.provider === count.provider,
+      ).length;
+      if (count.count !== expectedCount) {
+        fail(
+          `Routing decision ${index}.distribution.counts.${count.provider}`,
+          "does not match preceding ledger decisions",
+        );
+      }
+    }
     if (existing === undefined) {
       stepsByKey.set(partialKey, {
         policy_revision: record.key.policy_revision,

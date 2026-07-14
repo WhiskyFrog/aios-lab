@@ -49,6 +49,17 @@ const ESCALATION_REASON_CODES = new Set([
   "duplicate_evidence",
   "context_failure",
 ]);
+const HISTORY_REASON_CODES = new Set([
+  "capacity",
+  "timeout",
+  "provider_error",
+  "test_failure",
+  "review_rejected",
+  "duplicate_evidence",
+  "context_failure",
+  "operator_override",
+  "no_eligible_candidate",
+]);
 
 // Hard-gate reason codes in the fixed order they are evaluated. Cost and
 // distribution operate strictly after these gates and can never restore a
@@ -487,25 +498,85 @@ function validateWorkload(workload, key, config) {
   }
 }
 
-function validateHistory(history) {
+function validateHistory(history, config, currentKey) {
   if (!Array.isArray(history)) {
     fail("history", "must be an array of prior decision records");
   }
-  return history.map((entry, index) => {
+  const candidateById = new Map(config.candidates.map((candidate) => [candidate.id, candidate]));
+  const groups = new Map();
+  const normalized = history.map((entry, index) => {
     const label = `history[${index}]`;
-    if (!isObject(entry) || !isObject(entry.key) || !isObject(entry.chosen)) {
-      fail(label, "must contain key and chosen objects");
-    }
+    exactKeys(entry, ["key", "step", "chosen", "reason"], label);
     const key = validateDecisionKey(entry.key);
     nonNegativeInteger(entry.step, `${label}.step`);
+    exactKeys(entry.chosen, ["candidate", "provider"], `${label}.chosen`);
     identifier(entry.chosen.candidate, `${label}.chosen.candidate`);
     identifier(entry.chosen.provider, `${label}.chosen.provider`);
-    const reasonCode = entry.reason?.code ?? null;
-    if (reasonCode !== null && typeof reasonCode !== "string") {
-      fail(`${label}.reason.code`, "must be a string or null");
+    const candidate = candidateById.get(entry.chosen.candidate);
+    if (candidate === undefined) {
+      fail(`${label}.chosen.candidate`, `references unknown candidate ${entry.chosen.candidate}`);
     }
-    return { key, step: entry.step, chosen: entry.chosen, reason_code: reasonCode };
+    if (candidate.provider !== entry.chosen.provider) {
+      fail(`${label}.chosen.provider`, "must match the configured candidate");
+    }
+    if (!candidate.roles.includes(key.role)) {
+      fail(`${label}.chosen.candidate`, `is ineligible for Role ${key.role}`);
+    }
+    let reasonCode = null;
+    if (entry.reason !== null) {
+      exactKeys(entry.reason, ["code"], `${label}.reason`);
+      if (!HISTORY_REASON_CODES.has(entry.reason.code)) {
+        fail(`${label}.reason.code`, `has an unknown value: ${String(entry.reason.code)}`);
+      }
+      reasonCode = entry.reason.code;
+    }
+    if (entry.step === 0 && reasonCode !== null) {
+      fail(`${label}.reason`, "must be null for an initial step");
+    }
+    if (entry.step > 0 && reasonCode === null) {
+      fail(`${label}.reason`, "must explain a fallback or escalation step");
+    }
+    const partialKey = `${key.task}:${key.role}:${key.attempt}`;
+    const group = groups.get(partialKey) ?? {
+      policy_revision: key.policy_revision,
+      steps: [],
+      candidates: new Set(),
+    };
+    if (group.policy_revision !== key.policy_revision) {
+      fail(label, `conflicts with another policy revision for ${partialKey}`);
+    }
+    if (group.steps.includes(entry.step)) {
+      fail(label, `duplicates ${decisionKeyString(key)} step ${entry.step}`);
+    }
+    if (group.candidates.has(entry.chosen.candidate)) {
+      fail(label, `reuses candidate ${entry.chosen.candidate} for ${partialKey}`);
+    }
+    group.steps.push(entry.step);
+    group.candidates.add(entry.chosen.candidate);
+    groups.set(partialKey, group);
+    return {
+      key,
+      step: entry.step,
+      chosen: { candidate: candidate.id, provider: candidate.provider },
+      reason_code: reasonCode,
+    };
   });
+  for (const [partialKey, group] of groups) {
+    group.steps.forEach((step, index) => {
+      if (step !== index) {
+        fail("history", `has non-contiguous or out-of-order steps for ${partialKey}`);
+      }
+    });
+  }
+  const currentPartial = `${currentKey.task}:${currentKey.role}:${currentKey.attempt}`;
+  const currentGroup = groups.get(currentPartial);
+  if (
+    currentGroup !== undefined &&
+    currentGroup.policy_revision !== currentKey.policy_revision
+  ) {
+    fail("history", `uses another policy revision for ${currentPartial}`);
+  }
+  return normalized;
 }
 
 function validateImplementerDecision(decision, key, config, tierRanks) {
@@ -575,6 +646,11 @@ function workloadSummary(workload) {
       rejection_reasons: [...workload.lower_tier.rejection_reasons],
     },
     sources: { ...workload.sources },
+    diagnostics: {
+      strict_planning_contract: workload.diagnostics.strict_planning_contract,
+      plan_errors: workload.diagnostics.plan_errors.length,
+      history_errors: workload.diagnostics.history_errors.length,
+    },
   };
 }
 
@@ -682,7 +758,7 @@ export function selectCandidate({
   const normalizedConfig = validateRoutingConfig(config);
   const validatedKey = validateDecisionKey(key);
   validateWorkload(workload, validatedKey, normalizedConfig);
-  const priorDecisions = validateHistory(history);
+  const priorDecisions = validateHistory(history, normalizedConfig, validatedKey);
   const tierRanks = new Map(normalizedConfig.tiers.map(({ id, rank }) => [id, rank]));
   const decision = validateImplementerDecision(
     implementerDecision,

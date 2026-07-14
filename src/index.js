@@ -17,6 +17,7 @@ export {
 export { SessionLedger } from "./sessions.js";
 export {
   buildWorkloadContext,
+  isSafeModelIdentifier,
   loadExecutionConfig,
   parseExecutionConfig,
   RoutingConfigError,

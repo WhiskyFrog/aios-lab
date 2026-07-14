@@ -219,7 +219,11 @@ function historyRow(selection) {
   return {
     key: selection.key,
     step: selection.step,
-    chosen: selection.chosen,
+    chosen: {
+      candidate: selection.chosen.candidate,
+      provider: selection.chosen.provider,
+    },
+    reason: selection.step === 0 ? null : { code: "provider_error" },
   };
 }
 
@@ -402,6 +406,7 @@ test("distribution never beats a better fitness tuple", () => {
     key: key({ task: `task-${String(9100 + index).padStart(4, "0")}` }),
     step: 0,
     chosen: { candidate: "claude-lower", provider: "claude" },
+    reason: null,
   }));
   const selected = choose({ config: unequal, history });
   assert.equal(selected.chosen.candidate, "claude-lower");
@@ -434,18 +439,73 @@ test("fallback steps are contiguous, bounded, and never reuse a candidate", () =
   assert.equal(selected[2].fallback.available, false);
   assert.throws(() => choose({ history }), /fallback limit 2 is exhausted/);
   assert.throws(
-    () => choose({ history: [{ ...history[0], step: 1 }] }),
-    /non-contiguous steps/,
+    () =>
+      choose({
+        history: [{ ...history[0], step: 1, reason: { code: "provider_error" } }],
+      }),
+    /non-contiguous or out-of-order steps/,
+  );
+});
+
+test("history is canonical and rejects forged, duplicate, or conflicting rows", () => {
+  const initial = historyRow(choose());
+
+  const forgedProvider = structuredClone(initial);
+  forgedProvider.chosen.provider = "codex";
+  assert.throws(
+    () => choose({ key: key({ attempt: 2 }), history: [forgedProvider] }),
+    /provider: must match the configured candidate/,
+  );
+
+  const extra = { ...structuredClone(initial), model: "hidden" };
+  assert.throws(
+    () => choose({ key: key({ attempt: 2 }), history: [extra] }),
+    /history\[0\]\.model: is not allowed/,
+  );
+
+  assert.throws(
+    () => choose({ key: key({ attempt: 2 }), history: [initial, structuredClone(initial)] }),
+    /duplicates .* step 0/,
+  );
+
+  const otherRevision = structuredClone(initial);
+  otherRevision.key.policy_revision = "policy-v2";
+  assert.throws(
+    () => choose({ key: key({ attempt: 2 }), history: [initial, otherRevision] }),
+    /conflicts with another policy revision/,
+  );
+  assert.throws(
+    () => choose({ history: [otherRevision] }),
+    /uses another policy revision/,
+  );
+
+  const fallback = {
+    key: initial.key,
+    step: 1,
+    chosen: { candidate: "codex-lower", provider: "codex" },
+    reason: { code: "timeout" },
+  };
+  assert.throws(
+    () => choose({ key: key({ attempt: 2 }), history: [fallback, initial] }),
+    /non-contiguous or out-of-order/,
   );
 });
 
 test("per-Task escalation use is exposed and bounded across action keys", () => {
-  const escalationRows = [8, 9].map((attempt) => ({
-    key: key({ attempt }),
-    step: 0,
-    chosen: { candidate: "claude-lower", provider: "claude" },
-    reason: { code: "context_failure" },
-  }));
+  const escalationRows = [8, 9].flatMap((attempt) => [
+    {
+      key: key({ attempt }),
+      step: 0,
+      chosen: { candidate: "claude-lower", provider: "claude" },
+      reason: null,
+    },
+    {
+      key: key({ attempt }),
+      step: 1,
+      chosen: { candidate: "codex-lower", provider: "codex" },
+      reason: { code: "context_failure" },
+    },
+  ]);
   const selected = choose({ history: escalationRows });
   assert.deepEqual(selected.escalation, { used: 2, limit: 2, available: false });
 
@@ -457,6 +517,12 @@ test("per-Task escalation use is exposed and bounded across action keys", () => 
           {
             key: key({ attempt: 10 }),
             step: 0,
+            chosen: { candidate: "claude-lower", provider: "claude" },
+            reason: null,
+          },
+          {
+            key: key({ attempt: 10 }),
+            step: 1,
             chosen: { candidate: "codex-lower", provider: "codex" },
             reason: { code: "review_rejected" },
           },
@@ -720,7 +786,8 @@ test("ledger compare-and-swap rejects stale writers and immutable rewrites", asy
   await assert.rejects(ledger.record(right, record), RoutingLedgerConflictError);
 
   const changed = structuredClone(record);
-  changed.workload.risk = "high";
+  changed.recorded_at = LATER;
+  changed.observed_at = LATER;
   await assert.rejects(ledger.record(recorded, changed), /Refusing to rewrite/);
 
   const changedStatus = structuredClone(record);
@@ -751,7 +818,7 @@ test("ledger serializes overlapping writers and rejects fabricated snapshots", a
   const current = await ledger.load();
   const fabricated = {
     ...current,
-    decisions: current.decisions[0].key.task === "task-9001" ? [second] : [first],
+    decisions: current.decisions[0].key.attempt === 1 ? [second] : [first],
   };
   await assert.rejects(
     ledger.record(fabricated, current.decisions[0]),
@@ -899,7 +966,43 @@ test("ledger source evidence is closed and cannot carry prompt, environment, or 
   if (unsafeModel.chosen.candidate === unsafeModel.considered[0].candidate) {
     unsafeModel.chosen.model = unsafeModel.considered[0].model;
   }
-  assert.throws(() => validateDecisionRecord(unsafeModel), /model.*bounded provider model identifier/);
+  assert.throws(
+    () => validateDecisionRecord(unsafeModel),
+    /model.*bounded, credential-safe provider model identifier/,
+  );
+});
+
+test("credential, token, URL, and local-path model ids fail before storage", async (t) => {
+  const unsafeModels = [
+    "sk-abcdefghijk",
+    "ghp_abcdefghijk",
+    "AKIAABCDEFGHIJKLMNOP",
+    "AIzaabcdefghijklmnop",
+    "token:topsecret",
+    "https://provider.example/model",
+    "C:/Users/alice/model",
+  ];
+  for (const model of unsafeModels) {
+    const unsafeCatalog = config();
+    unsafeCatalog.candidates[0].model = model;
+    assert.throws(
+      () => choose({ config: unsafeCatalog }),
+      /model: resembles a credential, token, URL, or local path|model: has an invalid value/,
+    );
+
+    const unsafeRecord = structuredClone(initialRecord());
+    unsafeRecord.considered[0].model = model;
+    assert.throws(
+      () => validateDecisionRecord(unsafeRecord),
+      /credential-safe provider model identifier/,
+    );
+  }
+
+  const { file, ledger } = await temporaryLedger(t);
+  const unsafeRecord = structuredClone(initialRecord());
+  unsafeRecord.considered[0].model = "sk-abcdefghijk";
+  await assert.rejects(ledger.record(await ledger.load(), unsafeRecord));
+  await assert.rejects(readFile(file, "utf8"), (error) => error?.code === "ENOENT");
 });
 
 test("strict ledger validation closes workload and distribution cross-field invariants", () => {
@@ -927,6 +1030,77 @@ test("strict ledger validation closes workload and distribution cross-field inva
   assert.throws(
     () => validateDecisionRecord(impossibleChange),
     /must identify a change from the fitness winner/,
+  );
+});
+
+test("ledger replays preceding decisions and rejects a non-winning candidate", async (t) => {
+  const { file, ledger } = await temporaryLedger(t);
+  const firstSelection = choose();
+  const firstRecord = initialRecord(firstSelection);
+  let state = await ledger.record(await ledger.load(), firstRecord);
+
+  const actualHistory = [historyRow(firstSelection)];
+  const secondSelection = choose({ key: key({ attempt: 2 }), history: actualHistory });
+  const secondRecord = initialRecord(secondSelection, {
+    recorded_at: LATER,
+    observed_at: LATER,
+  });
+  state = await ledger.record(state, secondRecord);
+  assert.equal(state.decisions[1].distribution.observed, 1);
+  assert.equal(state.decisions[1].chosen.provider, "codex");
+
+  const wrongWinner = structuredClone(secondRecord);
+  const claude = wrongWinner.considered.find(
+    (entry) => entry.candidate === "claude-lower",
+  );
+  wrongWinner.chosen = {
+    candidate: claude.candidate,
+    provider: claude.provider,
+    model: claude.model,
+    tier: claude.tier,
+  };
+  wrongWinner.distribution.changed_winner = false;
+  assert.throws(
+    () => validateDecisionRecord(wrongWinner),
+    /greatest provider deficit/,
+  );
+
+  const fakePrior = {
+    key: key({ attempt: 9 }),
+    step: 0,
+    chosen: { candidate: "codex-lower", provider: "codex" },
+    reason: null,
+  };
+  const fabricatedSelection = choose({
+    key: key({ attempt: 3 }),
+    history: [fakePrior],
+  });
+  const fabricatedRecord = initialRecord(fabricatedSelection, {
+    recorded_at: "2026-07-14T05:00:02.000Z",
+    observed_at: "2026-07-14T05:00:02.000Z",
+  });
+  assert.doesNotThrow(() => validateDecisionRecord(fabricatedRecord));
+  await assert.rejects(
+    ledger.record(state, fabricatedRecord),
+    /actual preceding ledger window|does not match preceding ledger decisions/,
+  );
+
+  const malformed = {
+    schema: "aios.routing-decisions/v1",
+    updated_at: fabricatedRecord.observed_at,
+    decisions: [firstRecord, fabricatedRecord],
+  };
+  await writeFile(file, `${JSON.stringify(malformed)}\n`, "utf8");
+  await assert.rejects(ledger.load(), /does not match preceding ledger decisions/);
+});
+
+test("ledger recomputes lower-tier evidence instead of trusting eligibility claims", () => {
+  const record = initialRecord();
+  const fabricated = structuredClone(record);
+  fabricated.workload.risk = "high";
+  assert.throws(
+    () => validateDecisionRecord(fabricated),
+    /rejection_reasons: does not match normalized evidence/,
   );
 });
 

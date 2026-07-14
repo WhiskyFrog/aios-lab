@@ -15,6 +15,7 @@ import { validateCommand } from "./workers.js";
 
 const IDENTIFIER = /^[a-z0-9][a-z0-9._-]*$/;
 const MODEL_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$/;
+const SENSITIVE_MODEL_IDENTIFIER = /(?:\bsk-[A-Za-z0-9_-]{8,}\b|\b(?:gh[pousr]|glpat|xox[baprs])[-_][A-Za-z0-9_-]{8,}\b|\bAKIA[A-Z0-9]{12,}\b|\bAIza[A-Za-z0-9_-]{16,}\b|(?:api[_-]?key|token|secret|password)[:=_-]|^[A-Za-z]:\/|^[a-z]+:\/\/)/i;
 const TASK_SELECTOR = /^(?:\*|task-[0-9]{4,})$/;
 const PLAN_SELECTOR = /^[a-z0-9][a-z0-9-]*$/;
 const ROUTED_ROLES = new Set(["implementer", "reviewer"]);
@@ -63,6 +64,14 @@ function nonEmptyString(value, label, pattern = null) {
     fail(label, `has an invalid value: ${normalized}`);
   }
   return normalized;
+}
+
+export function isSafeModelIdentifier(value) {
+  return (
+    typeof value === "string" &&
+    MODEL_IDENTIFIER.test(value) &&
+    !SENSITIVE_MODEL_IDENTIFIER.test(value)
+  );
 }
 
 function positiveInteger(value, label) {
@@ -178,7 +187,13 @@ function validateCandidates(value, catalogs) {
     return {
       id: nonEmptyString(entry.id, `${label}.id`, IDENTIFIER),
       provider: nonEmptyString(entry.provider, `${label}.provider`, IDENTIFIER),
-      model: nonEmptyString(entry.model, `${label}.model`, MODEL_IDENTIFIER),
+      model: (() => {
+        const model = nonEmptyString(entry.model, `${label}.model`, MODEL_IDENTIFIER);
+        if (!isSafeModelIdentifier(model)) {
+          fail(`${label}.model`, "resembles a credential, token, URL, or local path");
+        }
+        return model;
+      })(),
       tier: nonEmptyString(entry.tier, `${label}.tier`, IDENTIFIER),
       roles,
       command,

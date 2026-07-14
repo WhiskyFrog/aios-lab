@@ -371,6 +371,11 @@ exist in the active configuration, and agree field-for-field with the workload.
 The selector recomputes the complete ordered lower-tier rejection list rather
 than trusting a supplied eligibility flag. Reviewer comparison likewise binds
 the supplied Implementer candidate, provider, and tier back to the catalog.
+Prior decisions use one closed projection containing the exact key, step,
+candidate/provider pair, and normalized fallback reason. Before any count is
+used, the selector checks the current catalog relationship, Role eligibility,
+one policy revision per action, unique candidates and steps, and contiguous
+step order across every history key.
 
 `RoutingDecisionLedger` persists strict `aios.routing-decisions/v1` JSON at
 `.aios/runtime/routing-decisions.json` with atomic replace and snapshot
@@ -401,6 +406,13 @@ distribution targets, provider uniqueness, count totals, exact rational
 deficits, equivalent-provider coverage, winner-change claims, same-provider
 review evidence, and override/choice agreement. A structurally valid JSON file
 with inconsistent audit facts is therefore malformed state, not trusted history.
+Credential-, token-, URL-, and local-path-shaped model ids are rejected at both
+catalog and ledger boundaries. The ledger stores bounded planning/history
+diagnostic counts, recomputes lower-tier rejection evidence, replays each
+finite distribution window from the actual preceding rows, and verifies that
+the greatest-deficit provider plus lowest candidate id produced the recorded
+winner. Self-consistent but fabricated counts therefore fail both load and
+record operations.
 
 ## Command Worker
 
