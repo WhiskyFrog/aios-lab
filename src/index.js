@@ -21,13 +21,17 @@ export {
   buildWorkloadContext,
   isSafeModelIdentifier,
   loadExecutionConfig,
+  normalizeRouteOverrides,
   parseExecutionConfig,
+  parseRouteOverride,
   RoutingConfigError,
+  validateRouteOverridesForConfig,
   validateRoutingConfig,
 } from "./routing.js";
 export {
   decisionKeyString,
   NoEligibleCandidateError,
+  OVERRIDE_DISPLACEABLE_REASON_CODES,
   RoutingPolicyError,
   selectCandidate,
   SELECTION_REASON_CODES,
@@ -47,7 +51,9 @@ export {
   validateDecisionRecord,
 } from "./routing-ledger.js";
 export {
+  resolveRouteOverride,
   RoutedAssignmentResolver,
   RoutingExhaustedError,
+  RoutingOverrideFallbackError,
   routingPolicyRevision,
 } from "./routing-dispatch.js";

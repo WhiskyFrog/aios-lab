@@ -124,6 +124,69 @@ export class RoutingExhaustedError extends WorkerError {
   }
 }
 
+export class RoutingOverrideFallbackError extends WorkerError {
+  constructor(candidate, reason, options = undefined) {
+    super(
+      `Route override pinned candidate ${candidate} and denies fallback after ${reason}`,
+      options,
+    );
+    this.name = "RoutingOverrideFallbackError";
+  }
+}
+
+// Resolves which operator override, if any, governs one Task/Role action.
+// Exact Task selectors take precedence over * for the same Role; at equal
+// specificity a CLI override displaces the configured override, and that
+// displaced configured candidate is preserved as audit evidence. A CLI
+// override pins its candidate for the whole action and never permits
+// fallback; a configured override declares allow_fallback explicitly.
+export function resolveRouteOverride({ cliOverrides, config, task, role }) {
+  const match = (rules, selectorTask) =>
+    rules.find(
+      (rule) => rule.selector.role === role && rule.selector.task === selectorTask,
+    ) ?? null;
+  const configured = config.overrides ?? [];
+  for (const selectorTask of [task, "*"]) {
+    const cli = match(cliOverrides, selectorTask);
+    const fromConfig = match(configured, selectorTask);
+    if (cli !== null) {
+      return {
+        candidate: cli.candidate,
+        source: "cli",
+        selector: { task: selectorTask, role },
+        allow_fallback: false,
+        displaced_config_candidate: fromConfig?.candidate ?? null,
+      };
+    }
+    if (fromConfig !== null) {
+      return {
+        candidate: fromConfig.candidate,
+        source: "config",
+        selector: { task: selectorTask, role },
+        allow_fallback: fromConfig.allow_fallback,
+        displaced_config_candidate: null,
+      };
+    }
+  }
+  return null;
+}
+
+// The override input fields that identify a decision's policy input. The
+// recorded row also carries derived evidence (policy winner, rationale);
+// only these inputs decide whether a rerun reuses or conflicts.
+function overrideInputProjection(override) {
+  if (override === null || override === undefined) {
+    return null;
+  }
+  return {
+    candidate: override.candidate,
+    source: override.source,
+    selector: { task: override.selector.task, role: override.selector.role },
+    allow_fallback: override.allow_fallback,
+    displaced_config_candidate: override.displaced_config_candidate,
+  };
+}
+
 class RoutedWorker {
   constructor({
     root,
@@ -137,6 +200,9 @@ class RoutedWorker {
     sessionLedger,
     store,
     timeoutMs,
+    actionOverride = null,
+    selectionReason = null,
+    onDispatch = null,
   }) {
     this.root = root;
     this.configPath = configPath;
@@ -149,9 +215,38 @@ class RoutedWorker {
     this.sessionLedger = sessionLedger;
     this.store = store;
     this.timeoutMs = timeoutMs;
+    this.actionOverride = actionOverride;
+    this.selectionReason = selectionReason;
+    this.onDispatch = onDispatch;
     this.pendingRecovery = null;
     this.deferredCandidate = null;
     this.lastSessionId = null;
+  }
+
+  // The sanitized projection of the step this Worker is about to launch:
+  // never argv, environment, credentials, or continuation tokens. The
+  // action-level override stays visible even after an allowed fallback so no
+  // recovery silently cancels the fact that the initial choice was overridden.
+  #dispatchSummary() {
+    return Object.freeze({
+      task: this.key.task,
+      role: this.key.role,
+      attempt: this.key.attempt,
+      step: this.selection.step,
+      candidate: this.selection.chosen.candidate,
+      provider: this.selection.chosen.provider,
+      model: this.selection.chosen.model,
+      tier: this.selection.chosen.tier,
+      override:
+        this.actionOverride === null
+          ? null
+          : Object.freeze({
+              source: this.actionOverride.source,
+              candidate: this.actionOverride.candidate,
+              allow_fallback: this.actionOverride.allow_fallback,
+            }),
+      reason: this.selectionReason,
+    });
   }
 
   requestRecovery(reason) {
@@ -202,8 +297,25 @@ class RoutedWorker {
         "Task changed before routed fallback; no additional Worker was launched",
       );
     }
+    // A fallback-denying override pins its candidate for this action: a
+    // capacity pause keeps the existing waiting outcome on the same
+    // candidate, and every other failure ends the route here instead of
+    // consulting the bounded fallback policy.
+    const overrideDeniesFallback =
+      this.selection.override != null && this.selection.override.allow_fallback === false;
     if (reason === "capacity") {
       await this.#event("capacity_pause", reason, diagnostic);
+      if (overrideDeniesFallback) {
+        return false;
+      }
+    } else if (overrideDeniesFallback) {
+      await this.#event("failure", reason, diagnostic);
+      await this.#event(
+        "exhausted",
+        "routing_exhausted",
+        `route override ${this.selection.override.candidate} denies fallback after ${reason}`,
+      );
+      throw new RoutingOverrideFallbackError(this.selection.override.candidate, reason);
     }
     const config = await this.#freshConfig();
     let snapshot = await this.decisionLedger.load();
@@ -248,6 +360,7 @@ class RoutedWorker {
     });
     await this.decisionLedger.record(snapshot, record);
     this.selection = next;
+    this.selectionReason = reason;
     this.pendingRecovery = null;
     this.deferredCandidate = null;
     this.lastSessionId = null;
@@ -286,6 +399,7 @@ class RoutedWorker {
       } else {
         await this.#event("launch", null, "", continuation === null ? null : this.lastSessionId);
       }
+      this.onDispatch?.(this.#dispatchSummary());
       const commandWorker = new CommandWorker(candidate.command, {
         cwd: this.root,
         timeoutMs: this.timeoutMs,
@@ -335,7 +449,14 @@ class RoutedWorker {
 export class RoutedAssignmentResolver {
   constructor(
     configPath,
-    { cwd, timeoutMs = 300_000, ledger = null, decisionLedger = null, store = null } = {},
+    {
+      cwd,
+      timeoutMs = 300_000,
+      ledger = null,
+      decisionLedger = null,
+      store = null,
+      routeOverrides = [],
+    } = {},
   ) {
     this.configPath = path.resolve(configPath);
     this.root = path.resolve(cwd ?? path.dirname(this.configPath));
@@ -345,6 +466,8 @@ export class RoutedAssignmentResolver {
     this.decisionLedger =
       decisionLedger ?? new RoutingDecisionLedger(routingDecisionsPath(this.root));
     this.store = store ?? new TaskStore(this.root);
+    this.routeOverrides = Object.freeze(structuredClone([...routeOverrides]));
+    this.lastRoutingSummary = null;
   }
 
   async policyRevision() {
@@ -401,9 +524,17 @@ export class RoutedAssignmentResolver {
       attempt: context.attempt,
       policy_revision: revision,
     };
+    const requestedOverride = resolveRouteOverride({
+      cliOverrides: this.routeOverrides,
+      config: loaded.config,
+      task: key.task,
+      role,
+    });
     let snapshot = await this.decisionLedger.load();
     const existing = await this.decisionLedger.resolveKey(key);
     let selection;
+    let actionOverride;
+    let selectionReason = null;
     if (existing === null) {
       const implementerDecision = implementerDecisionFor(snapshot.decisions, key);
       selection = selectCandidate({
@@ -412,13 +543,30 @@ export class RoutedAssignmentResolver {
         key,
         history: historyProjection(snapshot.decisions),
         implementerDecision,
+        override: requestedOverride,
       });
       const timestamp = new Date().toISOString();
       snapshot = await this.decisionLedger.record(
         snapshot,
         decisionRecordFromSelection(selection, { recorded_at: timestamp }),
       );
+      actionOverride = selection.override;
     } else {
+      // The override is part of this decision's policy input. A recorded row
+      // is immutable: the identical override input reuses it, and a changed
+      // or removed override is a policy-input conflict that fails closed
+      // instead of rewriting recorded history.
+      const recordedInput = overrideInputProjection(existing.steps[0].override);
+      if (
+        stableStringify(recordedInput) !==
+        stableStringify(overrideInputProjection(requestedOverride))
+      ) {
+        throw new WorkerError(
+          `Routing decision ${existing.key_string} was recorded with a different ` +
+            "route-override input; recorded decisions are immutable, so changing " +
+            "an override requires a new attempt rather than rewriting this row",
+        );
+      }
       if (existing.active.status !== "selected") {
         throw new WorkerError(
           `Routing decision ${existing.key_string} is already ${existing.active.status} and cannot be relaunched safely`,
@@ -428,6 +576,8 @@ export class RoutedAssignmentResolver {
         ...existing.active,
         key_string: existing.key_string,
       };
+      actionOverride = existing.steps[0].override;
+      selectionReason = existing.active.reason?.code ?? null;
     }
     return new RoutedWorker({
       root: this.root,
@@ -441,6 +591,11 @@ export class RoutedAssignmentResolver {
       sessionLedger: this.sessionLedger,
       store: this.store,
       timeoutMs: this.timeoutMs,
+      actionOverride,
+      selectionReason,
+      onDispatch: (summary) => {
+        this.lastRoutingSummary = summary;
+      },
     });
   }
 }

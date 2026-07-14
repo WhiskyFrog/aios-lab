@@ -562,6 +562,100 @@ export function parseExecutionConfig(value) {
   });
 }
 
+// Parses one --route-override value using the same selector grammar as the
+// routing config's override table: an exact task-#### id or * for the Task,
+// a routed Role, and a catalog candidate id. Nothing here ever accepts argv,
+// executable paths, environment variables, or credentials.
+export function parseRouteOverride(value) {
+  const shape =
+    "must be shaped <task-selector>:<role>=<candidate-id>, for example task-0001:implementer=claude-high";
+  if (typeof value !== "string" || value.trim().length === 0) {
+    fail("--route-override", shape);
+  }
+  const trimmed = value.trim();
+  const equals = trimmed.indexOf("=");
+  const selector = equals === -1 ? trimmed : trimmed.slice(0, equals);
+  const candidate = equals === -1 ? "" : trimmed.slice(equals + 1);
+  const colon = selector.indexOf(":");
+  if (equals === -1 || colon === -1 || candidate.length === 0) {
+    fail(`--route-override ${trimmed}`, shape);
+  }
+  const task = selector.slice(0, colon);
+  const role = selector.slice(colon + 1);
+  if (!TASK_SELECTOR.test(task)) {
+    fail(
+      `--route-override ${trimmed}`,
+      `has an invalid Task selector ${task}; use an exact task-#### id or *`,
+    );
+  }
+  if (role === "approver") {
+    fail(
+      `--route-override ${trimmed}`,
+      "cannot target approver; the human Approver stays outside model routing",
+    );
+  }
+  if (!ROUTED_ROLES.has(role)) {
+    fail(
+      `--route-override ${trimmed}`,
+      `has an unknown Role ${role}; use implementer or reviewer`,
+    );
+  }
+  if (!IDENTIFIER.test(candidate)) {
+    fail(`--route-override ${trimmed}`, `has an invalid candidate id ${candidate}`);
+  }
+  return { selector: { task, role }, candidate };
+}
+
+// Parses and cross-checks every --route-override value: two rules for the
+// same selector are always a conflict, whether duplicated or contradictory.
+export function normalizeRouteOverrides(values) {
+  const overrides = values.map(parseRouteOverride);
+  const seen = new Set();
+  for (const override of overrides) {
+    const selectorKey = `${override.selector.task}:${override.selector.role}`;
+    if (seen.has(selectorKey)) {
+      fail(
+        "--route-override",
+        `has duplicate or conflicting rules for selector ${selectorKey}`,
+      );
+    }
+    seen.add(selectorKey);
+  }
+  return overrides;
+}
+
+// Confirms every parsed CLI override names an existing, Role-eligible
+// candidate in an active aios.routing/v1 catalog before any Worker launch.
+export function validateRouteOverridesForConfig(overrides, execution) {
+  if (overrides.length === 0) {
+    return;
+  }
+  if (execution?.kind !== "routing") {
+    fail(
+      "--route-override",
+      "requires an aios.routing/v1 execution configuration; the legacy aios.assignments/v1 schema does not support routing overrides",
+    );
+  }
+  const catalog = new Map(
+    execution.config.candidates.map((candidate) => [candidate.id, candidate]),
+  );
+  for (const override of overrides) {
+    const candidate = catalog.get(override.candidate);
+    if (candidate === undefined) {
+      fail(
+        "--route-override",
+        `references candidate ${override.candidate}, which is not in the routing catalog`,
+      );
+    }
+    if (!candidate.roles.includes(override.selector.role)) {
+      fail(
+        "--route-override",
+        `candidate ${override.candidate} is ineligible for Role ${override.selector.role}`,
+      );
+    }
+  }
+}
+
 export async function loadExecutionConfig(filePath) {
   let value;
   try {

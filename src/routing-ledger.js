@@ -5,6 +5,8 @@ import { atomicReplace } from "./documents.js";
 import { isSafeModelIdentifier } from "./routing.js";
 import {
   decisionKeyString,
+  OVERRIDE_DISPLACEABLE_REASON_CODES,
+  overrideDisplacedRationale,
   SELECTION_REASON_CODES,
   validateDecisionKey,
 } from "./routing-policy.js";
@@ -69,7 +71,10 @@ const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 
 const IDENTIFIER = /^[a-z0-9][a-z0-9._-]*$/;
 const TASK_ID = /^task-[0-9]{4,}$/;
+const TASK_SELECTOR = /^(?:\*|task-[0-9]{4,})$/;
 const ROUTED_ROLES = new Set(["implementer", "reviewer"]);
+const OVERRIDE_SOURCES = new Set(["cli", "config"]);
+const OVERRIDE_DISPLACEABLE = new Set(OVERRIDE_DISPLACEABLE_REASON_CODES);
 const WORK_KINDS = new Set(["planning", "implementation", "unknown"]);
 const BANDS = new Set(["low", "medium", "high", "unknown"]);
 const CONTEXT_BANDS = new Set(["small", "medium", "large"]);
@@ -709,14 +714,78 @@ function validateSameProviderReview(value, label) {
   });
 }
 
+// The complete operator-override audit row: who displaced the policy choice
+// (cli or config, via which selector), what the normal policy winner was, the
+// deterministic displaced rationale, which displaceable budget preferences
+// were overridden, whether fallback is permitted, and explicit confirmation
+// that every hard safety gate passed.
 function validateOverride(value, label) {
   if (value === null) {
     return null;
   }
-  exactKeys(value, ["candidate", "source"], label);
+  exactKeys(
+    value,
+    [
+      "candidate",
+      "source",
+      "selector",
+      "allow_fallback",
+      "policy_winner",
+      "displaced_budgets",
+      "displaced_rationale",
+      "displaced_config_candidate",
+      "hard_gates_passed",
+    ],
+    label,
+  );
   identifier(value.candidate, `${label}.candidate`);
-  identifier(value.source, `${label}.source`);
-  return { candidate: value.candidate, source: value.source };
+  enumValue(value.source, OVERRIDE_SOURCES, `${label}.source`);
+  exactKeys(value.selector, ["task", "role"], `${label}.selector`);
+  if (typeof value.selector.task !== "string" || !TASK_SELECTOR.test(value.selector.task)) {
+    fail(`${label}.selector.task`, "must be an exact Task id or *");
+  }
+  enumValue(value.selector.role, ROUTED_ROLES, `${label}.selector.role`);
+  booleanValue(value.allow_fallback, `${label}.allow_fallback`);
+  validateChosen(value.policy_winner, `${label}.policy_winner`);
+  if (!Array.isArray(value.displaced_budgets)) {
+    fail(`${label}.displaced_budgets`, "must be an array");
+  }
+  value.displaced_budgets.forEach((entry, index) =>
+    enumValue(entry, OVERRIDE_DISPLACEABLE, `${label}.displaced_budgets[${index}]`),
+  );
+  if (new Set(value.displaced_budgets).size !== value.displaced_budgets.length) {
+    fail(`${label}.displaced_budgets`, "must not contain duplicates");
+  }
+  boundedLabel(value.displaced_rationale, `${label}.displaced_rationale`, DIAGNOSTIC_LIMIT);
+  if (
+    value.displaced_rationale !==
+    overrideDisplacedRationale(value.candidate, value.policy_winner.candidate)
+  ) {
+    fail(`${label}.displaced_rationale`, "must be the deterministic displaced rationale");
+  }
+  if (value.displaced_config_candidate !== null) {
+    identifier(value.displaced_config_candidate, `${label}.displaced_config_candidate`);
+    if (value.source !== "cli") {
+      fail(
+        `${label}.displaced_config_candidate`,
+        "is only recorded when a CLI override displaces a configured override",
+      );
+    }
+  }
+  if (value.hard_gates_passed !== true) {
+    fail(`${label}.hard_gates_passed`, "must confirm every hard safety gate passed");
+  }
+  return {
+    candidate: value.candidate,
+    source: value.source,
+    selector: { task: value.selector.task, role: value.selector.role },
+    allow_fallback: value.allow_fallback,
+    policy_winner: { ...value.policy_winner },
+    displaced_budgets: [...value.displaced_budgets],
+    displaced_rationale: value.displaced_rationale,
+    displaced_config_candidate: value.displaced_config_candidate,
+    hard_gates_passed: true,
+  };
 }
 
 function validateEvents(value, label, recordedAt) {
@@ -814,15 +883,57 @@ export function validateDecisionRecord(value, label = "Routing decision") {
   }
   validateConsidered(value.considered, `${label}.considered`);
   validateChosen(value.chosen, `${label}.chosen`);
+  const override = validateOverride(value.override, `${label}.override`);
+  if (override !== null) {
+    if (override.candidate !== value.chosen.candidate) {
+      fail(`${label}.override.candidate`, "must match the chosen candidate");
+    }
+    if (value.step !== 0) {
+      fail(`${label}.override`, "must be attached to the initial selection step");
+    }
+    if (override.selector.task !== "*" && override.selector.task !== key.task) {
+      fail(`${label}.override.selector.task`, "must select the decision key task");
+    }
+    if (override.selector.role !== key.role) {
+      fail(`${label}.override.selector.role`, "must select the decision key role");
+    }
+  }
   const chosenEntry = value.considered.find(
     (entry) => entry.candidate === value.chosen.candidate,
   );
-  if (chosenEntry === undefined || chosenEntry.eligible !== true) {
+  if (chosenEntry === undefined) {
     fail(`${label}.chosen`, "must be an eligible considered candidate");
+  }
+  if (override === null) {
+    if (chosenEntry.eligible !== true) {
+      fail(`${label}.chosen`, "must be an eligible considered candidate");
+    }
+  } else if (
+    JSON.stringify(chosenEntry.reasons) !== JSON.stringify(override.displaced_budgets)
+  ) {
+    fail(
+      `${label}.override.displaced_budgets`,
+      "must equal the chosen candidate's displaceable gate evidence",
+    );
   }
   for (const field of ["provider", "model", "tier"]) {
     if (value.chosen[field] !== chosenEntry[field]) {
       fail(`${label}.chosen.${field}`, "must match the considered candidate");
+    }
+  }
+  // With an override, the fitness/distribution invariants below govern the
+  // recorded normal policy winner rather than the launched candidate.
+  const policyChosen = override === null ? value.chosen : override.policy_winner;
+  const policyLabel = override === null ? `${label}.chosen` : `${label}.override.policy_winner`;
+  const policyEntry = value.considered.find(
+    (entry) => entry.candidate === policyChosen.candidate,
+  );
+  if (policyEntry === undefined || policyEntry.eligible !== true) {
+    fail(policyLabel, "must be an eligible considered candidate");
+  }
+  for (const field of ["provider", "model", "tier"]) {
+    if (policyChosen[field] !== policyEntry[field]) {
+      fail(`${policyLabel}.${field}`, "must match the considered candidate");
     }
   }
   validateFitness(value.fitness, `${label}.fitness`);
@@ -843,8 +954,13 @@ export function validateDecisionRecord(value, label = "Routing decision") {
   if (equivalentEntries.some((entry) => entry === undefined || entry.eligible !== true)) {
     fail(`${label}.distribution.equivalent`, "must contain only eligible considered candidates");
   }
-  if (!value.distribution.equivalent.includes(value.chosen.candidate)) {
-    fail(`${label}.distribution.equivalent`, "must include the chosen candidate");
+  if (!value.distribution.equivalent.includes(policyChosen.candidate)) {
+    fail(
+      `${label}.distribution.equivalent`,
+      override === null
+        ? "must include the chosen candidate"
+        : "must include the normal policy winner",
+    );
   }
   const equivalentProviders = [...new Set(equivalentEntries.map(({ provider }) => provider))].sort(
     compareText,
@@ -869,13 +985,13 @@ export function validateDecisionRecord(value, label = "Routing decision") {
   const expectedWinner = equivalentEntries.find(
     ({ provider }) => provider === greatestDeficit.provider,
   );
-  if (value.chosen.candidate !== expectedWinner.candidate) {
+  if (policyChosen.candidate !== expectedWinner.candidate) {
     fail(
-      `${label}.chosen.candidate`,
+      override === null ? `${label}.chosen.candidate` : `${label}.override.policy_winner`,
       "must be the stable candidate-id winner for the greatest provider deficit",
     );
   }
-  const expectedChanged = value.chosen.candidate !== value.distribution.equivalent[0];
+  const expectedChanged = policyChosen.candidate !== value.distribution.equivalent[0];
   if (value.distribution.changed_winner !== expectedChanged) {
     fail(`${label}.distribution.changed_winner`, "must identify a change from the fitness winner");
   }
@@ -896,10 +1012,6 @@ export function validateDecisionRecord(value, label = "Routing decision") {
         "must match every cross-provider considered candidate and reason",
       );
     }
-  }
-  const override = validateOverride(value.override, `${label}.override`);
-  if (override !== null && override.candidate !== value.chosen.candidate) {
-    fail(`${label}.override.candidate`, "must match the chosen candidate");
   }
   const recordedAt = timestamp(value.recorded_at, `${label}.recorded_at`);
   const events = validateEvents(value.events ?? [], `${label}.events`, recordedAt);
@@ -934,7 +1046,7 @@ export function validateDecisionRecord(value, label = "Routing decision") {
 
 export function decisionRecordFromSelection(
   selection,
-  { status = "selected", recorded_at, observed_at, reason = null, override = null },
+  { status = "selected", recorded_at, observed_at, reason = null, override = selection.override ?? null },
 ) {
   if (status !== "selected") {
     fail("Routing decision.status", "must be selected before dispatch");
@@ -958,7 +1070,7 @@ export function decisionRecordFromSelection(
     fitness: structuredClone(selection.fitness),
     distribution: structuredClone(selection.distribution),
     same_provider_review: structuredClone(selection.same_provider_review),
-    override,
+    override: structuredClone(override),
     events: [],
     status,
     recorded_at,

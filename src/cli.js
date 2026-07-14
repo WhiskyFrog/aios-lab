@@ -11,6 +11,11 @@ import {
   PlanValidationError,
 } from "./plans.js";
 import { runProgression, STOP_REASONS } from "./progression.js";
+import {
+  loadExecutionConfig,
+  normalizeRouteOverrides,
+  validateRouteOverridesForConfig,
+} from "./routing.js";
 import { FileAssignmentResolver } from "./workers.js";
 
 const PROGRESS_EXIT_CODES = Object.freeze({
@@ -30,10 +35,24 @@ function usage() {
     "Usage:",
     "  aios run <task-id> [--root <path>] [--assignments <path>] [--timeout-ms <n>]",
     "       [--wait-for-capacity] [--max-capacity-wait-ms <n>] [--max-capacity-pauses <n>]",
+    "       [--route-override <task-selector>:<role>=<candidate-id>]...",
     "  aios progress <plan-dir> [--root <path>] [--assignments <path>] [--timeout-ms <n>]",
     "       [--wait-for-capacity] [--max-capacity-wait-ms <n>] [--max-capacity-pauses <n>]",
+    "       [--route-override <task-selector>:<role>=<candidate-id>]...",
     "  aios dashboard [--root <path>] [--out <file>]",
     "  aios adopt <plan-dir> [--root <path>] [--check]",
+    "",
+    "The repeatable --route-override flag displaces the adaptive routing policy",
+    "choice for one command. <task-selector> is an exact task-#### id or * for",
+    "every Task, <role> is implementer or reviewer (the human approver stays",
+    "outside model routing), and <candidate-id> must name a Role-eligible",
+    "candidate in the active aios.routing/v1 catalog. Quote the whole value on",
+    "PowerShell and on POSIX shells (for example --route-override",
+    "\"*:implementer=claude-high\") so * and : are not expanded or split by the",
+    "shell. A CLI override pins its candidate and denies fallback; a configured",
+    "override table entry declares allow_fallback explicitly. Overrides cannot",
+    "bypass hard safety gates and are rejected with the legacy",
+    "aios.assignments/v1 schema.",
     "",
     "The run command runs one Task through each assigned Role until it is",
     "done, blocked, waiting for Worker capacity, or halted by an error.",
@@ -72,6 +91,11 @@ function parseEngineOptions(rest, options) {
     if (!value) {
       throw new Error(`Missing value for ${flag}`);
     }
+    if (flag === "--route-override") {
+      options.routeOverrideValues.push(value);
+      index += 1;
+      continue;
+    }
     if (flag === "--root") {
       options.root = path.resolve(value);
     } else if (flag === "--assignments") {
@@ -97,7 +121,19 @@ function parseEngineOptions(rest, options) {
     index += 1;
   }
   options.assignments ??= path.join(options.root, ".aios", "assignments.json");
+  options.routeOverrides = normalizeRouteOverrides(options.routeOverrideValues);
   return options;
+}
+
+// Reports whether the execution config is adaptive routing. Consulted only
+// after an engine run so the optional routing summary is attached in routing
+// mode; a missing or malformed config reads as legacy and changes nothing.
+async function routingModeEnabled(assignmentsPath) {
+  try {
+    return (await loadExecutionConfig(assignmentsPath)).kind === "routing";
+  } catch {
+    return false;
+  }
 }
 
 function engineOptionDefaults(command) {
@@ -110,6 +146,8 @@ function engineOptionDefaults(command) {
     waitForCapacity: false,
     maxCapacityWaitMs: 604_800_000,
     maxCapacityPauses: 8,
+    routeOverrideValues: [],
+    routeOverrides: [],
   };
 }
 
@@ -254,10 +292,26 @@ export async function main(argv = process.argv.slice(2)) {
     }
   }
 
+  // Route overrides are validated against the execution config before any
+  // Worker launch or Task mutation. Without overrides the config is not read
+  // here at all, so legacy runs keep their exact behavior and output.
+  if (options.routeOverrides.length > 0) {
+    try {
+      validateRouteOverridesForConfig(
+        options.routeOverrides,
+        await loadExecutionConfig(options.assignments),
+      );
+    } catch (error) {
+      console.error(error.message);
+      return 64;
+    }
+  }
+
   if (options.command === "progress") {
     const assignments = new FileAssignmentResolver(options.assignments, {
       cwd: options.root,
       timeoutMs: options.timeoutMs,
+      routeOverrides: options.routeOverrides,
     });
     const engine = new LoopEngine({ root: options.root, assignments });
     const controller = new AbortController();
@@ -281,22 +335,27 @@ export async function main(argv = process.argv.slice(2)) {
       process.removeListener("SIGINT", cancel);
       process.removeListener("SIGTERM", cancel);
     }
-    console.log(
-      JSON.stringify({
-        plan: outcome.plan,
-        completed: outcome.completed,
-        complete: outcome.stopReason === STOP_REASONS.PLAN_COMPLETE,
-        task: outcome.task,
-        stop_reason: outcome.stopReason,
-        action: outcome.action,
-      }),
-    );
+    const report = {
+      plan: outcome.plan,
+      completed: outcome.completed,
+      complete: outcome.stopReason === STOP_REASONS.PLAN_COMPLETE,
+      task: outcome.task,
+      stop_reason: outcome.stopReason,
+      action: outcome.action,
+    };
+    if (await routingModeEnabled(options.assignments)) {
+      const summary = assignments.routingSummary();
+      report.routing =
+        summary !== null && summary.task === outcome.task ? summary : null;
+    }
+    console.log(JSON.stringify(report));
     return PROGRESS_EXIT_CODES[outcome.stopReason];
   }
 
   const assignments = new FileAssignmentResolver(options.assignments, {
     cwd: options.root,
     timeoutMs: options.timeoutMs,
+    routeOverrides: options.routeOverrides,
   });
   const engine = new LoopEngine({ root: options.root, assignments });
   const controller = new AbortController();
@@ -325,6 +384,11 @@ export async function main(argv = process.argv.slice(2)) {
   };
   if (outcome.kind === "waiting") {
     report.retry_at = outcome.retryAt;
+  }
+  if (await routingModeEnabled(options.assignments)) {
+    const summary = assignments.routingSummary();
+    report.routing =
+      summary !== null && summary.task === report.task ? summary : null;
   }
   console.log(JSON.stringify(report));
   if (outcome.kind === "done") {

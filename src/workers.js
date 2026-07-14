@@ -373,15 +373,25 @@ export class StaticAssignmentResolver {
 }
 
 export class FileAssignmentResolver {
-  constructor(configPath, { cwd, timeoutMs = 300_000, ledger = null } = {}) {
+  constructor(
+    configPath,
+    { cwd, timeoutMs = 300_000, ledger = null, routeOverrides = [] } = {},
+  ) {
     this.configPath = path.resolve(configPath);
     this.cwd = path.resolve(cwd ?? path.dirname(this.configPath));
     this.timeoutMs = timeoutMs;
     this.ledger =
       ledger ??
       new SessionLedger(path.join(this.cwd, ".aios", "runtime", "sessions.json"));
+    this.routeOverrides = routeOverrides;
     this.routedResolver = null;
     this.preparedConfig = null;
+  }
+
+  // The sanitized summary of the most recently dispatched routed Role action,
+  // or null when no routed Worker has launched through this resolver.
+  routingSummary() {
+    return this.routedResolver?.lastRoutingSummary ?? null;
   }
 
   async policyRevision() {
@@ -427,8 +437,14 @@ export class FileAssignmentResolver {
         cwd: this.cwd,
         timeoutMs: this.timeoutMs,
         ledger: this.ledger,
+        routeOverrides: this.routeOverrides,
       });
       return this.routedResolver.resolve(role, context);
+    }
+    if (this.routeOverrides.length > 0) {
+      throw new AssignmentError(
+        "Route overrides require an aios.routing/v1 configuration; the legacy aios.assignments/v1 schema does not support them",
+      );
     }
     if (!hasExactKeys(config, ["schema", "assignments"])) {
       throw new AssignmentError(

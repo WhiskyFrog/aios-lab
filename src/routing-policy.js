@@ -6,7 +6,9 @@ import { validateRoutingConfig } from "./routing.js";
 
 const IDENTIFIER = /^[a-z0-9][a-z0-9._-]*$/;
 const TASK_ID = /^task-[0-9]{4,}$/;
+const TASK_SELECTOR = /^(?:\*|task-[0-9]{4,})$/;
 const ROUTED_ROLES = new Set(["implementer", "reviewer"]);
+const OVERRIDE_SOURCES = new Set(["cli", "config"]);
 const WORK_KINDS = new Set(["planning", "implementation", "unknown"]);
 const BANDS = new Set(["low", "medium", "high", "unknown"]);
 const CONTEXT_BANDS = new Set(["small", "medium", "large"]);
@@ -80,6 +82,15 @@ const HISTORY_REASON_CODES = new Set([
   "invalid_result",
   "routing_exhausted",
 ]);
+
+// The only selection gates an explicit operator override may displace. They
+// encode cost and latency preference, not safety; every other reason code in
+// SELECTION_REASON_CODES is a hard safety gate that no override bypasses.
+export const OVERRIDE_DISPLACEABLE_REASON_CODES = Object.freeze([
+  "cost_budget_exceeded",
+  "latency_budget_exceeded",
+]);
+const OVERRIDE_DISPLACEABLE = new Set(OVERRIDE_DISPLACEABLE_REASON_CODES);
 
 // Hard-gate reason codes in the fixed order they are evaluated. Cost and
 // distribution operate strictly after these gates and can never restore a
@@ -643,6 +654,69 @@ function validateImplementerDecision(decision, key, config, tierRanks) {
   return decision;
 }
 
+// An operator override input: a validated catalog candidate pinned for this
+// exact decision by a CLI flag or the routing config's override table. It is
+// resolved and precedence-ordered by the caller; this module only enforces
+// that it names this action and a Role-eligible catalog candidate.
+function validateOverrideInput(override, key, config) {
+  if (override === null) {
+    return null;
+  }
+  exactKeys(
+    override,
+    ["candidate", "source", "selector", "allow_fallback", "displaced_config_candidate"],
+    "override",
+  );
+  identifier(override.candidate, "override.candidate");
+  enumValue(override.source, OVERRIDE_SOURCES, "override.source");
+  exactKeys(override.selector, ["task", "role"], "override.selector");
+  if (typeof override.selector.task !== "string" || !TASK_SELECTOR.test(override.selector.task)) {
+    fail("override.selector.task", `must be an exact Task id or *, got ${String(override.selector.task)}`);
+  }
+  if (override.selector.task !== "*" && override.selector.task !== key.task) {
+    fail("override.selector.task", `does not select decision key task ${key.task}`);
+  }
+  enumValue(override.selector.role, ROUTED_ROLES, "override.selector.role");
+  if (override.selector.role !== key.role) {
+    fail("override.selector.role", `does not select decision key role ${key.role}`);
+  }
+  if (typeof override.allow_fallback !== "boolean") {
+    fail("override.allow_fallback", "must be a boolean");
+  }
+  if (override.displaced_config_candidate !== null) {
+    identifier(override.displaced_config_candidate, "override.displaced_config_candidate");
+    if (override.source !== "cli") {
+      fail(
+        "override.displaced_config_candidate",
+        "is only recorded when a CLI override displaces a configured override",
+      );
+    }
+  }
+  const candidate = config.candidates.find((entry) => entry.id === override.candidate);
+  if (candidate === undefined) {
+    fail("override.candidate", `references unknown candidate ${override.candidate}`);
+  }
+  if (!candidate.roles.includes(key.role)) {
+    fail(
+      "override.candidate",
+      `candidate ${override.candidate} is ineligible for Role ${key.role}`,
+    );
+  }
+  return {
+    candidate: override.candidate,
+    source: override.source,
+    selector: { task: override.selector.task, role: override.selector.role },
+    allow_fallback: override.allow_fallback,
+    displaced_config_candidate: override.displaced_config_candidate,
+  };
+}
+
+export function overrideDisplacedRationale(overrideCandidate, policyWinner) {
+  return overrideCandidate === policyWinner
+    ? "override matches the normal policy winner"
+    : `override displaced normal policy winner ${policyWinner}`;
+}
+
 function workloadSummary(workload) {
   return {
     task: workload.task_id,
@@ -777,6 +851,7 @@ export function selectCandidate({
   history = [],
   implementerDecision = null,
   recovery = null,
+  override = null,
 }) {
   const normalizedConfig = validateRoutingConfig(config);
   const validatedKey = validateDecisionKey(key);
@@ -789,6 +864,7 @@ export function selectCandidate({
     normalizedConfig,
     tierRanks,
   );
+  const normalizedOverride = validateOverrideInput(override, validatedKey, normalizedConfig);
   const keyString = decisionKeyString(validatedKey);
 
   // Explicit step index: prior recorded steps of this exact key determine the
@@ -807,6 +883,9 @@ export function selectCandidate({
     throw new RoutingPolicyError(
       `history: fallback limit ${limits.fallbacks_per_action} is exhausted for ${keyString}`,
     );
+  }
+  if (normalizedOverride !== null && step !== 0) {
+    fail("override", "applies only to the initial selection step of an action");
   }
   const priorCandidates = new Set(priorSteps.map((entry) => entry.chosen.candidate));
   let normalizedRecovery = null;
@@ -1086,6 +1165,47 @@ export function selectCandidate({
     chosenEntry = equivalent.find((entry) => entry.provider === bestDeficit.provider);
   }
 
+  // An operator override displaces only the fitness/cost/latency/distribution
+  // preference expressed by chosenEntry. Every hard safety gate above already
+  // ran; a pinned candidate that failed any non-displaceable gate fails closed
+  // here with each violated invariant named, and there is no force path.
+  let launchEntry = chosenEntry;
+  let overrideEvidence = null;
+  if (normalizedOverride !== null) {
+    const pinned = routedConsidered.find(
+      (entry) => entry.candidate === normalizedOverride.candidate,
+    );
+    const violated = pinned.reasons.filter(
+      (reason) => !OVERRIDE_DISPLACEABLE.has(reason),
+    );
+    if (violated.length > 0) {
+      throw new RoutingPolicyError(
+        `override: candidate ${normalizedOverride.candidate} for ${keyString} ` +
+          `violates hard safety gates: ${violated.join(", ")}`,
+      );
+    }
+    overrideEvidence = {
+      candidate: pinned.candidate,
+      source: normalizedOverride.source,
+      selector: { ...normalizedOverride.selector },
+      allow_fallback: normalizedOverride.allow_fallback,
+      displaced_config_candidate: normalizedOverride.displaced_config_candidate,
+      policy_winner: {
+        candidate: chosenEntry.candidate,
+        provider: chosenEntry.provider,
+        model: chosenEntry.model,
+        tier: chosenEntry.tier,
+      },
+      displaced_budgets: [...pinned.reasons],
+      displaced_rationale: overrideDisplacedRationale(
+        pinned.candidate,
+        chosenEntry.candidate,
+      ),
+      hard_gates_passed: true,
+    };
+    launchEntry = pinned;
+  }
+
   return deepFreeze({
     key: validatedKey,
     key_string: keyString,
@@ -1106,11 +1226,12 @@ export function selectCandidate({
     workload: workloadSummary(workload),
     considered: routedConsidered,
     chosen: {
-      candidate: chosenEntry.candidate,
-      provider: chosenEntry.provider,
-      model: chosenEntry.model,
-      tier: chosenEntry.tier,
+      candidate: launchEntry.candidate,
+      provider: launchEntry.provider,
+      model: launchEntry.model,
+      tier: launchEntry.tier,
     },
+    override: overrideEvidence,
     fitness: {
       provider_distinct: bestVector[0],
       tier_surplus: -bestVector[1],
@@ -1133,7 +1254,7 @@ export function selectCandidate({
       changed_winner: chosenEntry.candidate !== fitnessWinner.candidate,
     },
     same_provider_review:
-      decision !== null && chosenEntry.provider === decision.provider
+      decision !== null && launchEntry.provider === decision.provider
         ? {
             implementer: {
               candidate: decision.candidate,

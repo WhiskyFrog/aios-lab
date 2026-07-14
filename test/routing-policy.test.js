@@ -752,8 +752,27 @@ function initialRecord(selection = choose(), options = {}) {
     observed_at: options.observed_at ?? NOW,
     status: options.status ?? "selected",
     reason: options.reason ?? null,
-    override: options.override ?? null,
+    override: options.override ?? selection?.override ?? null,
   });
+}
+
+function attachedOverride() {
+  return {
+    candidate: "claude-lower",
+    source: "cli",
+    selector: { task: "task-9001", role: "implementer" },
+    allow_fallback: false,
+    policy_winner: {
+      candidate: "claude-lower",
+      provider: "claude",
+      model: "claude-configured-lower",
+      tier: "lower",
+    },
+    displaced_budgets: [],
+    displaced_rationale: "override matches the normal policy winner",
+    displaced_config_candidate: null,
+    hard_gates_passed: true,
+  };
 }
 
 test("decision ledger records atomically, resolves exact keys, and projects sanitized evidence", async (t) => {
@@ -851,7 +870,7 @@ test("ledger outcome and override updates move forward and preserve immutable ev
   state = await ledger.attachOverride(state, {
     key: record.key,
     step: 0,
-    override: { candidate: "claude-lower", source: "cli" },
+    override: attachedOverride(),
     observed_at: NOW,
   });
   state = await ledger.updateOutcome(state, {
@@ -890,7 +909,7 @@ test("ledger outcome and override updates move forward and preserve immutable ev
     ledger.attachOverride(state, {
       key: record.key,
       step: 0,
-      override: { candidate: "claude-lower", source: "cli" },
+      override: attachedOverride(),
       observed_at: LATER,
     }),
     /already has an override/,
@@ -912,7 +931,7 @@ test("ledger outcome and override updates move forward and preserve immutable ev
     withoutOverride.ledger.attachOverride(secondState, {
       key: secondRecord.key,
       step: 0,
-      override: { candidate: "claude-lower", source: "cli" },
+      override: attachedOverride(),
       observed_at: LATER,
     }),
     /before dispatch/,
