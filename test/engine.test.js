@@ -253,6 +253,70 @@ test("changes_requested loops to a replacement attempt and then passes", async (
   ]);
 });
 
+test("identical Implementer evidence halts without consuming another retry", async (t) => {
+  const { root, store } = await createRepository(t);
+  const unchanged = implementation("unchanged submission");
+  const implementer = new ScriptedWorker(unchanged, structuredClone(unchanged));
+  const reviewer = new ScriptedWorker(
+    review("changes_requested", "Address the concrete review findings."),
+  );
+
+  const outcome = await new LoopEngine({
+    root,
+    assignments: new TrackingResolver({ implementer, reviewer }),
+  }).run(TASK_ID);
+
+  assert.equal(outcome.kind, "halted");
+  assert.equal(outcome.category, "worker_failure");
+  assert.match(outcome.reason, /repeated the evidence from Attempt 1/);
+  const haltedTask = await loadValidated(store);
+  assert.equal(haltedTask.metadata.state, "implement");
+  assert.equal(haltedTask.metadata.retry.count, 1);
+  assert.equal(haltedTask.metadata.last_review, "review-0001");
+  assert.match(haltedTask.body, /### Attempt 1/);
+  assert.doesNotMatch(haltedTask.body, /### Attempt 2/);
+  assert.equal(implementer.calls.length, 2);
+  assert.equal(reviewer.calls.length, 1);
+  assert.equal((await store.listReviews()).length, 1);
+
+  const recovered = await new LoopEngine({
+    root,
+    assignments: new TrackingResolver({
+      implementer: new ScriptedWorker(implementation("corrected submission")),
+      reviewer: new ScriptedWorker(review("pass")),
+    }),
+  }).run(TASK_ID);
+  assert.equal(recovered.kind, "done");
+  const doneTask = await loadValidated(store);
+  assert.equal(doneTask.metadata.retry.count, 1);
+  assert.match(doneTask.body, /### Attempt 1[\s\S]*### Attempt 2/);
+});
+
+test("changing either evidence field preserves automatic retry", async (t) => {
+  const { root, store } = await createRepository(t);
+  const implementer = new ScriptedWorker(
+    result("implementer", {
+      summary: "Implemented the same scoped correction.",
+      verification: "First verification evidence.",
+    }),
+    result("implementer", {
+      summary: "Implemented the same scoped correction.",
+      verification: "Replacement verification evidence.",
+    }),
+  );
+  const reviewer = new ScriptedWorker(review("changes_requested"), review("pass"));
+
+  const outcome = await new LoopEngine({
+    root,
+    assignments: new TrackingResolver({ implementer, reviewer }),
+  }).run(TASK_ID);
+
+  assert.equal(outcome.kind, "done");
+  const task = await loadValidated(store);
+  assert.equal(task.metadata.retry.count, 1);
+  assert.match(task.body, /First verification evidence[\s\S]*Replacement verification evidence/);
+});
+
 test("Result prose mentioning a future Attempt does not block that retry", async (t) => {
   const { root, store } = await createRepository(t);
   const implementer = new ScriptedWorker(

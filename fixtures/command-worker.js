@@ -79,6 +79,24 @@ function workerExecution({
 if (mode === "auto-loop") {
   const role = process.env.AIOS_ROLE;
   process.stdout.write(JSON.stringify(result(role)));
+} else if (mode === "repeat-loop") {
+  const role = process.env.AIOS_ROLE;
+  process.stdout.write(
+    JSON.stringify(
+      role === "reviewer"
+        ? {
+            schema: "aios.result/v1",
+            task: process.env.AIOS_TASK_ID,
+            role,
+            status: "success",
+            payload: {
+              verdict: "changes_requested",
+              findings: "The deterministic fixture requests a real correction.",
+            },
+          }
+        : result(role),
+    ),
+  );
 } else if (mode === "deferred") {
   const role = process.env.AIOS_ROLE;
   const id = `fixture-${role}`;

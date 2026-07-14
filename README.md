@@ -38,6 +38,13 @@ npm run aios -- run task-0003 --assignments .aios/assignments.json
 The Assignment file is re-read before every Role action. Replacing a command
 changes the Worker without changing the Task or Loop Engine.
 
+When a Review requests changes, the loop may invoke the Implementer again in
+the same foreground run. A replacement Attempt must provide new summary or
+verification evidence. If both fields exactly repeat the preceding framed
+Attempt, the run halts for operator recovery before appending another Attempt,
+creating another Review, or consuming another retry. Replace or correct the
+Worker and rerun; the Task remains resumable in `implement`.
+
 `aios run` exits with 0 when the Task reaches `done`, 2 when it reaches
 `blocked`, 1 when the run halts for operator recovery, and 64 for a usage
 error. A structured capacity deferral exits with 75 and reports `retry_at`

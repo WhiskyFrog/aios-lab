@@ -207,6 +207,55 @@ test("one CLI trigger runs command Implementer and Reviewer through done", async
   assert.match(await readFile(assignmentsPath, "utf8"), /"reviewer"/);
 });
 
+test("repeated Implementer evidence halts the CLI before retry exhaustion", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "aios-cli-repeat-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, ".aios", "tasks"), { recursive: true });
+  await mkdir(path.join(root, ".aios", "reviews"), { recursive: true });
+  await writeFile(
+    path.join(root, ".aios", "tasks", "task-9001.md"),
+    taskDocument(),
+    "utf8",
+  );
+  const assignmentsPath = path.join(root, ".aios", "assignments.json");
+  await writeFile(
+    assignmentsPath,
+    JSON.stringify({
+      schema: "aios.assignments/v1",
+      assignments: {
+        implementer: [process.execPath, fixture, "repeat-loop"],
+        reviewer: [process.execPath, fixture, "repeat-loop"],
+      },
+    }),
+    "utf8",
+  );
+
+  await assert.rejects(
+    executeFile(
+      process.execPath,
+      [cli, "run", "task-9001", "--root", root, "--assignments", assignmentsPath],
+      { cwd: root, windowsHide: true },
+    ),
+    (error) => {
+      const report = JSON.parse(error.stdout);
+      return (
+        error.code === 1 &&
+        report.kind === "halted" &&
+        report.state === "implement" &&
+        /repeated the evidence from Attempt 1/.test(report.reason)
+      );
+    },
+  );
+
+  const store = new TaskStore(root);
+  const task = await store.loadTask("task-9001");
+  assert.equal(task.metadata.state, "implement");
+  assert.equal(task.metadata.retry.count, 1);
+  assert.match(task.body, /### Attempt 1/);
+  assert.doesNotMatch(task.body, /### Attempt 2/);
+  assert.equal((await store.listReviews()).length, 1);
+});
+
 const PROGRESS_PROJECT = "test-project";
 const approverWorker = path.join(projectRoot, "workers", "human-approver.mjs");
 

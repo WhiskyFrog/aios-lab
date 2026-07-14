@@ -10,6 +10,7 @@ import {
   TaskConflictError,
   TaskStore,
   appendAttempt,
+  repeatsAttemptEvidence,
 } from "./documents.js";
 import { CapacityDeferredError } from "./workers.js";
 
@@ -311,6 +312,22 @@ export class LoopEngine {
       }
 
       if (role === "implementer") {
+        const previousAttempt = currentAttempt(task.metadata) - 1;
+        if (
+          previousAttempt > 0 &&
+          repeatsAttemptEvidence(
+            task.body,
+            previousAttempt,
+            result.payload.summary,
+            result.payload.verification,
+          )
+        ) {
+          return haltedWorker(
+            task,
+            `Implementer repeated the evidence from Attempt ${previousAttempt}; ` +
+              "submit evidence that describes the actual correction before retrying",
+          );
+        }
         const metadata = structuredClone(task.metadata);
         metadata.state = "review";
         let body;

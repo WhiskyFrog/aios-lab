@@ -103,10 +103,10 @@ function legacyAttemptNumbers(attempts) {
   return numbers;
 }
 
-function framedAttemptNumbers(attempts) {
+function framedAttempts(attempts) {
   const startPattern =
     /<!-- aios:attempt-frame v1 number=([0-9]+) summary=([0-9]+) verification=([0-9]+) -->/g;
-  const numbers = [];
+  const records = [];
   let cursor = 0;
   let firstFrame = -1;
 
@@ -139,11 +139,15 @@ function framedAttemptNumbers(attempts) {
     if (attempts.slice(verificationEnd, verificationEnd + suffix.length) !== suffix) {
       throw new StoreError(`Attempt ${number} has an invalid frame suffix`);
     }
-    numbers.push(number);
+    records.push({
+      number,
+      summary: attempts.slice(summaryStart, summaryEnd),
+      verification: attempts.slice(verificationStart, verificationEnd),
+    });
     cursor = verificationEnd + suffix.length;
   }
 
-  return { numbers, firstFrame };
+  return { records, firstFrame };
 }
 
 function attemptNumbers(body) {
@@ -155,18 +159,37 @@ function attemptNumbers(body) {
   // and parsing must operate on the same LF-normalized view regardless of
   // how a checkout or editor materialized the document.
   const attempts = normalizeLineEndings(section);
-  const framed = framedAttemptNumbers(attempts);
+  const framed = framedAttempts(attempts);
   if (framed.firstFrame === -1) {
     return legacyAttemptNumbers(attempts);
   }
   return [
     ...legacyAttemptNumbers(attempts.slice(0, framed.firstFrame)),
-    ...framed.numbers,
+    ...framed.records.map((record) => record.number),
   ];
 }
 
 export function countAttempts(body) {
   return attemptNumbers(body).length;
+}
+
+// Framed Attempts are length-delimited, so exact evidence comparison does
+// not need to parse or trust free-form Markdown. Legacy unframed Attempts
+// intentionally return false: their content boundaries are not authoritative.
+export function repeatsAttemptEvidence(body, attempt, summary, verification) {
+  const section = markdownSection(body, "Attempts");
+  if (!section) {
+    return false;
+  }
+  const framed = framedAttempts(normalizeLineEndings(section));
+  const previous = framed.records.find((record) => record.number === attempt);
+  if (!previous) {
+    return false;
+  }
+  return (
+    previous.summary === normalizeLineEndings(summary).trim() &&
+    previous.verification === normalizeLineEndings(verification).trim()
+  );
 }
 
 function validateAttemptProjection(body, metadata) {
