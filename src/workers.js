@@ -112,7 +112,7 @@ function hasExactKeys(value, keys) {
   );
 }
 
-function validateCommand(command, role) {
+export function validateCommand(command, role) {
   if (
     !Array.isArray(command) ||
     command.length === 0 ||

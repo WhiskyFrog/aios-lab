@@ -259,7 +259,7 @@ export function validateWorkerExecution(value) {
   };
 }
 
-function validateLedgerRow(value, index) {
+export function validateSessionLedgerRow(value, index = 0) {
   const label = `Session ledger row ${index}`;
   exactObject(
     value,
@@ -323,7 +323,7 @@ function validateLedger(value) {
   if (!Array.isArray(value.sessions)) {
     fail("Session ledger.sessions must be an array");
   }
-  const sessions = value.sessions.map(validateLedgerRow);
+  const sessions = value.sessions.map(validateSessionLedgerRow);
   const ids = new Set();
   for (let index = 0; index < sessions.length; index += 1) {
     const row = sessions[index];

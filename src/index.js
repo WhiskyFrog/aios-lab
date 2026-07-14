@@ -15,3 +15,10 @@ export {
   StaticAssignmentResolver,
 } from "./workers.js";
 export { SessionLedger } from "./sessions.js";
+export {
+  buildWorkloadContext,
+  loadExecutionConfig,
+  parseExecutionConfig,
+  RoutingConfigError,
+  validateRoutingConfig,
+} from "./routing.js";

@@ -97,7 +97,7 @@ function insideDirectPlanDirectory(root, planDirectory) {
   return path.dirname(planDirectory) === path.join(root, "plans");
 }
 
-function validatePlanMetadata(metadata, directoryName, problems) {
+export function validatePlanMetadata(metadata, directoryName, problems) {
   if (!exactKeys(metadata, ["schema", "id", "project", "profile", "profile_reason"])) {
     problems.push(
       "PLAN.md front matter must contain exactly: id, profile, profile_reason, project, schema",
@@ -133,8 +133,7 @@ function validatePlanMetadata(metadata, directoryName, problems) {
   return valid;
 }
 
-function validatePlanBody(body, proposalIds, problems) {
-  const known = new Set(proposalIds);
+export function validatePlanSections(body, problems) {
   for (const heading of [
     "Brief",
     "Profile Application",
@@ -146,6 +145,11 @@ function validatePlanBody(body, proposalIds, problems) {
       problems.push(`PLAN.md must contain a non-empty ${heading} section`);
     }
   }
+}
+
+function validatePlanBody(body, proposalIds, problems) {
+  validatePlanSections(body, problems);
+  const known = new Set(proposalIds);
   const allReferences = body.match(/\bP-[0-9]{2,}\b/g) ?? [];
   for (const reference of new Set(allReferences)) {
     if (!known.has(reference)) {

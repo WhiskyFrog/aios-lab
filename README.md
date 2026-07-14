@@ -264,6 +264,83 @@ directory. Exit codes are 0 for checked/adopted, 1 for plan validation or
 adoption failure, and 64 for command usage errors. Running the adopted Tasks is
 deliberately separate; orchestration remains out of scope.
 
+## Adaptive Routing Contracts (Foundation)
+
+`src/routing.js` defines the configuration and workload-evidence foundation for
+adaptive routing. It does not yet select or launch a model: the current
+`FileAssignmentResolver` remains the execution path for `aios.assignments/v1`,
+with the same re-read, session-ledger, and Role behavior described above.
+`parseExecutionConfig` activates the new foundation only when the input schema
+is explicitly `aios.routing/v1`; no routing decision ledger is written at this
+stage.
+
+An `aios.routing/v1` document declares all model information as operator data:
+
+- ordered `tiers` with unique positive ranks;
+- declared `capabilities`, `cost_classes`, and `latency_classes` catalogs;
+- `candidates` with a stable id, provider/model ids, tier, eligible Roles,
+  shell-free command argv, enabled state, context limit, capabilities, and
+  cost/latency class;
+- `policy` with the high tier, distribution window and positive provider
+  weights, bounded fallback/escalation limits, and default budgets;
+- optional provider-neutral `hints`, selected by exactly one Task or adopted
+  plan, that declare work kind, complexity, risk, capabilities, verification,
+  and budgets; and
+- optional candidate-id `overrides` selected by Task/wildcard and Role. Their
+  application is intentionally deferred to the later operator-control surface.
+
+The parser is strict at every object level and reports the exact path of unknown
+fields. Model names and capabilities are never inferred from strings or fetched
+from a provider. Candidate commands remain argv arrays and cannot introduce
+shell interpolation, credentials, or hidden environment configuration.
+
+`buildWorkloadContext` produces immutable, provider-neutral evidence. Its
+deterministic rules are:
+
+- Planning is recognized only by an explicit `work_kind: planning` hint or by
+  all three parts of a plan-only contract: an affirmative Objective line starts
+  with Produce/Create/Write/Deliver/Generate/Author and names a plan or proposals
+  under `plans/<id>/`, a single Constraints list item says the Implementer
+  writes only under that exact directory, and one inline verification command is exactly
+  `node src/cli.js adopt plans/<id> --check` or
+  `npm run aios -- adopt plans/<id> --check`. A title containing "plan",
+  separated command fragments, a different directory, or negative write prose
+  does not qualify.
+- Adopted parent discovery reuses the existing plan header, required-section,
+  Execution Order, Task, and project validation. No matching parent is recorded
+  as normal standalone uncertainty; multiple matches, a malformed plan, or an
+  invalid profile is safety-critical and closes the lower-tier gate. An
+  Execution Order mixing proposal `P-##` and adopted `task-####` ids is treated
+  as malformed rather than silently skipped, and plan matches/errors are sorted
+  so filesystem enumeration cannot change normalized evidence.
+- Task context is measured as UTF-8 bytes with an inspectable token estimate of
+  `ceil(bytes / 4)`: at most 8,000 bytes is `small`, at most 32,000 is `medium`,
+  and anything larger is `large`.
+- Without an explicit hint, structural complexity is `high` at eight Acceptance
+  Criteria items, five Constraints items, or more than 12,000 bytes; `medium` at
+  four criteria, two constraints, or more than 5,000 bytes; otherwise it is
+  `low`. Missing work kind, risk, capabilities, or objective verification stays
+  explicitly unknown rather than being inferred from prose.
+- Evidence precedence is fail-closed: malformed Review/session history, a
+  nonzero Task retry, a changes-requested Review, or a failed session makes risk
+  high; `approval: required` also makes risk high even when a hint claims low
+  risk. Conflicting planning evidence becomes unknown. Defaults never override
+  these facts.
+- The minimum tier is the configured high tier unless every lower-tier gate
+  passes. The exact pass case is an Implementer (not Reviewer), explicit
+  non-planning implementation hint, low complexity, low risk, small/medium
+  context, explicitly known capabilities, objective verification, no required
+  approval, no retry or unresolved failure, and no safety-critical uncertainty.
+  Every failed gate is returned as a stable rejection reason.
+
+The normalized context labels the source of Task/Role identity, work kind,
+parent plan, complexity, risk, context size, capabilities, verification,
+budgets, approval/retry, history, uncertainty, minimum tier, lower-tier reasons,
+and diagnostics. Supplied Reviews must be valid `aios.review/v1` documents with
+non-empty bodies; supplied sessions must be validated `aios.sessions/v1` ledger
+rows. Invalid history is recorded in diagnostics and forces the high tier rather
+than being ignored.
+
 ## Command Worker
 
 Commands are launched directly from their argv array with no shell
