@@ -79,6 +79,44 @@ Usage and cost are accumulated across resumed invocations of the same session.
 The ledger is not Task lifecycle truth and can be deleted without changing any
 Task.
 
+## Progress an Adopted Plan
+
+Run the ordered real Tasks in one already-adopted plan from a single foreground
+operator command:
+
+```console
+npm run aios -- progress plans/public-site --root . --assignments .aios/assignments.json
+```
+
+The plan path follows `adopt` resolution: an absolute path is used as-is and a
+relative path is resolved under `--root` (default: the current directory).
+`--assignments` defaults to `<root>/.aios/assignments.json`, and
+`--timeout-ms` defaults to `300000` for each Worker invocation. Capacity
+options have the same semantics and defaults as `run`: waiting is off unless
+`--wait-for-capacity` is supplied, `--max-capacity-wait-ms` defaults to
+`604800000`, and `--max-capacity-pauses` defaults to `8`.
+
+The command skips every Task already in `done`, runs the first unfinished Task
+through the existing Role loop, and continues in plan order until all Tasks are
+done or one reaches a stop condition. Its JSON report includes the plan id,
+completed Task ids, current Task, stop reason, and exact operator action.
+Re-running the same command is idempotent with respect to repository state:
+completed Tasks are not invoked again, so an operator can perform the reported
+action and resume without reconstructing an in-memory scheduler.
+
+SIGINT or SIGTERM covers the whole multi-Task command. Cancellation stops the
+active Worker or a capacity sleep and is also checked before dispatching the
+next Task, so no new Worker starts after cancellation. The completed-so-far
+list remains in the report. Exit codes are:
+
+- `0`: every Task in the plan is complete.
+- `3`: awaiting human approval.
+- `4`: blocked by rejection or retry exhaustion.
+- `5`: waiting for Worker capacity.
+- `6`: cancelled.
+- `7`: another halt, including Worker, document, or repository-conflict errors.
+- `64`: command usage error.
+
 ## Dashboard
 
 `aios dashboard` generates one self-contained, offline HTML file summarizing
@@ -450,12 +488,11 @@ wakeup, or reboot-safe session resume.
 
 ## Roadmap
 
-The next active milestone is `task-0017`: use the Planner to decompose a
-narrow, operator-invoked runner that advances through the ordered real Tasks in
-one adopted plan. It must reuse the existing single-Task Loop Engine, resume
-from repository state, and stop safely at Review, Approval, capacity, blocked,
-failure, cancellation, or conflict boundaries. This is sequential plan
-progression, not concurrent scheduling or a daemon.
+Sequential inter-Task progression is implemented: `aios progress` advances the
+ordered real Tasks in one adopted plan through the existing single-Task Loop
+Engine, resumes from repository state, and stops safely at Approval, capacity,
+blocked, failure, cancellation, or conflict boundaries. It remains an explicit
+foreground command, not concurrent scheduling or a daemon.
 
 The follow-on milestone is adaptive model routing. Once sequential progression
 is reliable, AIOS should evaluate each Task and Role using explicit evidence
