@@ -284,6 +284,406 @@ async function makePlan(root, name, options = {}) {
   return planDirectory;
 }
 
+function attemptFrames(count) {
+  return Array.from({ length: count }, (_, index) => {
+    const number = index + 1;
+    return [
+      `<!-- aios:attempt-frame v1 number=${number} summary=4 verification=4 -->`,
+      `### Attempt ${number}`,
+      "",
+      "#### Summary",
+      "",
+      "done",
+      "",
+      "#### Verification",
+      "",
+      "done",
+      `<!-- /aios:attempt-frame v1 number=${number} -->`,
+    ].join("\n");
+  }).join("\n\n");
+}
+
+async function makeAdoptedProgressPlan(root, name, taskIds, metadataId = name) {
+  const planDirectory = path.join(root, "plans", name);
+  await mkdir(planDirectory, { recursive: true });
+  const body = [
+    "---",
+    "schema: aios.plan/v1",
+    `id: ${metadataId}`,
+    "project: dash-project",
+    "profile: software-feature",
+    "profile_reason: Exercise read-only plan progress.",
+    "---",
+    "",
+    `# ${name}`,
+    "",
+    "## Brief",
+    "",
+    "Exercise plan progress.",
+    "",
+    "## Execution Order",
+    "",
+    ...taskIds.map((id, index) => `${index + 1}. ${id} is next.`),
+    "",
+  ].join("\n");
+  await writeFile(path.join(planDirectory, "PLAN.md"), body, "utf8");
+  return planDirectory;
+}
+
+async function writeDashboardTask(root, metadata, attempts = 0) {
+  await writeFile(
+    path.join(root, ".aios", "tasks", `${metadata.id}.md`),
+    taskDocument(metadata, attempts === 0 ? "" : attemptFrames(attempts)),
+    "utf8",
+  );
+}
+
+async function writeDashboardReview(root, { id, task, attempt, verdict }) {
+  await writeFile(
+    path.join(root, ".aios", "reviews", `${id}.md`),
+    reviewDocument({
+      schema: "aios.review/v1",
+      id,
+      project: "dash-project",
+      task,
+      attempt,
+      verdict,
+    }),
+    "utf8",
+  );
+}
+
+function progressSection(html) {
+  return /<section class="plan-progress-section"[\s\S]*?<\/section>/.exec(html)?.[0] ?? "";
+}
+
+test("Plan Progress renders durable current states, history, completion, and errors honestly", async (t) => {
+  const renderedSections = [];
+
+  await t.test("complete adopted plan", async (st) => {
+    const root = await makeRoot(st);
+    await writeDashboardReview(root, {
+      id: "review-0001",
+      task: "task-0001",
+      attempt: 1,
+      verdict: "pass",
+    });
+    await writeDashboardTask(
+      root,
+      {
+        schema: "aios.task/v1",
+        id: "task-0001",
+        project: "dash-project",
+        title: "Completed outcome",
+        state: "done",
+        retry: { count: 0, limit: 2 },
+        approval: "not_required",
+        last_review: "review-0001",
+      },
+      1,
+    );
+    await makeAdoptedProgressPlan(root, "complete-plan", ["task-0001"]);
+    const data = await collectDashboardData(root);
+    assert.equal(data.planProgress[0].complete, true);
+    assert.deepEqual(data.planProgress[0].completed, ["task-0001"]);
+    const section = progressSection(renderDashboard(data));
+    assert.match(section, /complete-plan/);
+    assert.match(section, /1 \/ 1/);
+    assert.match(section, /every ordered Task is done/);
+    renderedSections.push(section);
+  });
+
+  const durableCases = [
+    {
+      name: "approval-plan",
+      state: "approval",
+      approval: "required",
+      retry: { count: 0, limit: 2 },
+      attempt: 1,
+      verdict: "pass",
+      category: "awaiting_approval",
+      label: /Awaiting approval/,
+      action: /containing exactly &quot;approved&quot; or &quot;rejected&quot;, then rerun progression/,
+    },
+    {
+      name: "rejected-plan",
+      state: "blocked",
+      approval: "rejected",
+      retry: { count: 0, limit: 2 },
+      attempt: 1,
+      verdict: "pass",
+      category: "blocked_rejected",
+      label: /Blocked — rejected/,
+      action: /was rejected during approval; revise it with a fresh Attempt/,
+    },
+    {
+      name: "exhausted-plan",
+      state: "blocked",
+      approval: "not_required",
+      retry: { count: 1, limit: 1 },
+      attempt: 2,
+      verdict: "changes_requested",
+      category: "blocked_retry_exhausted",
+      label: /Blocked — retry limit exhausted/,
+      action: /exhausted its retry limit; a human must intervene/,
+    },
+  ];
+
+  for (const scenario of durableCases) {
+    await t.test(scenario.name, async (st) => {
+      const root = await makeRoot(st);
+      await writeDashboardReview(root, {
+        id: "review-0001",
+        task: "task-0001",
+        attempt: scenario.attempt,
+        verdict: scenario.verdict,
+      });
+      await writeDashboardTask(
+        root,
+        {
+          schema: "aios.task/v1",
+          id: "task-0001",
+          project: "dash-project",
+          title: "Durable state",
+          state: scenario.state,
+          retry: scenario.retry,
+          approval: scenario.approval,
+          last_review: "review-0001",
+        },
+        scenario.attempt,
+      );
+      await makeAdoptedProgressPlan(root, scenario.name, ["task-0001"]);
+      const data = await collectDashboardData(root);
+      const plan = data.planProgress[0];
+      assert.equal(plan.currentCategory, scenario.category);
+      assert.equal(typeof plan.action, "string");
+      const section = progressSection(renderDashboard(data));
+      assert.match(section, scenario.label);
+      assert.match(section, scenario.action);
+      assert.match(section, /Operator action:/);
+      assert.doesNotMatch(section, /Last observed/);
+      renderedSections.push(section);
+    });
+  }
+
+  await t.test("historical session evidence is visibly non-live and has no action", async (st) => {
+    const root = await makeRoot(st);
+    await writeDashboardTask(root, {
+      schema: "aios.task/v1",
+      id: "task-0001",
+      project: "dash-project",
+      title: "Implementation in progress",
+      state: "review",
+      retry: { count: 0, limit: 2 },
+      approval: "not_required",
+      last_review: null,
+    }, 1);
+    await makeAdoptedProgressPlan(root, "history-plan", ["task-0001"]);
+    await new SessionLedger(path.join(root, ".aios", "runtime", "sessions.json")).record({
+      id: "history-session",
+      task: "task-0001",
+      role: "reviewer",
+      model: "fixture-model",
+      started_at: "2026-07-14T01:00:00Z",
+      observed_at: "2026-07-14T01:02:00Z",
+      outcome: "failed",
+      usage: null,
+      cost_usd: null,
+      capacity: null,
+    });
+    await new SessionLedger(path.join(root, ".aios", "runtime", "sessions.json")).record({
+      id: "other-role-session",
+      task: "task-0001",
+      role: "implementer",
+      model: "fixture-model",
+      started_at: "2026-07-14T01:04:00Z",
+      observed_at: "2026-07-14T01:05:00Z",
+      outcome: "failed",
+      usage: null,
+      cost_usd: null,
+      capacity: null,
+    });
+    const data = await collectDashboardData(root);
+    const plan = data.planProgress[0];
+    assert.equal(plan.currentCategory, null);
+    assert.deepEqual(plan.lastObserved, {
+      role: "reviewer",
+      outcome: "failed",
+      observedAt: "2026-07-14T01:02:00.000Z",
+    });
+    const section = progressSection(renderDashboard(data));
+    assert.match(section, /Last observed/);
+    assert.match(section, /historical, not live status/);
+    assert.match(section, /failed/);
+    assert.match(section, /2026-07-14T01:02:00\.000Z/);
+    assert.doesNotMatch(section, /Operator action:/);
+    renderedSections.push(section);
+  });
+
+  await t.test("a newer completed row suppresses older failure history", async (st) => {
+    const root = await makeRoot(st);
+    await writeDashboardTask(root, {
+      schema: "aios.task/v1",
+      id: "task-0001",
+      project: "dash-project",
+      title: "Implementation in progress",
+      state: "implement",
+      retry: { count: 0, limit: 2 },
+      approval: "not_required",
+      last_review: null,
+    });
+    await makeAdoptedProgressPlan(root, "latest-session-plan", ["task-0001"]);
+    const ledger = new SessionLedger(path.join(root, ".aios", "runtime", "sessions.json"));
+    await ledger.record({
+      id: "older-failure",
+      task: "task-0001",
+      role: "implementer",
+      model: "fixture-model",
+      started_at: "2026-07-14T01:00:00Z",
+      observed_at: "2026-07-14T01:01:00Z",
+      outcome: "failed",
+      usage: null,
+      cost_usd: null,
+      capacity: null,
+    });
+    await ledger.record({
+      id: "newer-success",
+      task: "task-0001",
+      role: "implementer",
+      model: "fixture-model",
+      started_at: "2026-07-14T01:02:00Z",
+      observed_at: "2026-07-14T01:03:00Z",
+      outcome: "completed",
+      usage: null,
+      cost_usd: null,
+      capacity: null,
+    });
+    const data = await collectDashboardData(root);
+    assert.equal(data.planProgress[0].lastObserved, null);
+    const section = progressSection(renderDashboard(data));
+    assert.doesNotMatch(section, /Last observed/);
+    assert.doesNotMatch(section, /older-failure/);
+    renderedSections.push(section);
+  });
+
+  await t.test("interleaved done Tasks count as complete while first non-done stays current", async (st) => {
+    const root = await makeRoot(st);
+    await writeDashboardTask(root, {
+      schema: "aios.task/v1",
+      id: "task-0001",
+      project: "dash-project",
+      title: "Current implementation",
+      state: "implement",
+      retry: { count: 0, limit: 2 },
+      approval: "not_required",
+      last_review: null,
+    });
+    await writeDashboardReview(root, {
+      id: "review-0002",
+      task: "task-0002",
+      attempt: 1,
+      verdict: "pass",
+    });
+    await writeDashboardTask(
+      root,
+      {
+        schema: "aios.task/v1",
+        id: "task-0002",
+        project: "dash-project",
+        title: "Already complete",
+        state: "done",
+        retry: { count: 0, limit: 2 },
+        approval: "not_required",
+        last_review: "review-0002",
+      },
+      1,
+    );
+    await makeAdoptedProgressPlan(root, "interleaved-plan", ["task-0001", "task-0002"]);
+    const data = await collectDashboardData(root);
+    const plan = data.planProgress[0];
+    assert.equal(plan.currentTask, "task-0001");
+    assert.deepEqual(plan.completed, ["task-0002"]);
+    const section = progressSection(renderDashboard(data));
+    assert.match(section, /1 \/ 2/);
+    assert.match(section, /task-0002<\/code> <span class="task-position">done/);
+    renderedSections.push(section);
+  });
+
+  await t.test("not-yet-run plan has neither a durable marker nor history", async (st) => {
+    const root = await makeRoot(st);
+    for (const id of ["task-0001", "task-0002"]) {
+      await writeDashboardTask(root, {
+        schema: "aios.task/v1",
+        id,
+        project: "dash-project",
+        title: `Not started ${id}`,
+        state: "implement",
+        retry: { count: 0, limit: 2 },
+        approval: "not_required",
+        last_review: null,
+      });
+    }
+    await makeAdoptedProgressPlan(root, "fresh-plan", ["task-0001", "task-0002"]);
+    const data = await collectDashboardData(root);
+    const plan = data.planProgress[0];
+    assert.equal(plan.currentTask, "task-0001");
+    assert.deepEqual(plan.completed, []);
+    assert.equal(plan.currentCategory, null);
+    assert.equal(plan.lastObserved, null);
+    const section = progressSection(renderDashboard(data));
+    assert.match(section, /0 \/ 2/);
+    assert.match(section, /task-0001/);
+    assert.doesNotMatch(section, /<div class="current-state/);
+    assert.doesNotMatch(section, /Last observed/);
+    assert.doesNotMatch(section, /Operator action:/);
+    renderedSections.push(section);
+  });
+
+  await t.test("invalid adopted order is a named error card", async (st) => {
+    const root = await makeRoot(st);
+    await makeAdoptedProgressPlan(root, "invalid-order-plan", ["task-9999"]);
+    const data = await collectDashboardData(root);
+    assert.equal(data.planProgress[0].currentCategory, "invalid_document");
+    const section = progressSection(renderDashboard(data));
+    assert.match(section, /invalid-order-plan/);
+    assert.match(section, /Invalid document/);
+    assert.match(section, /task-9999/);
+    assert.match(section, /error-card/);
+    renderedSections.push(section);
+  });
+
+  await t.test("metadata id mismatch uses and names the discovered directory", async (st) => {
+    const root = await makeRoot(st);
+    await writeDashboardTask(root, {
+      schema: "aios.task/v1",
+      id: "task-0001",
+      project: "dash-project",
+      title: "Valid neighboring plan Task",
+      state: "implement",
+      retry: { count: 0, limit: 2 },
+      approval: "not_required",
+      last_review: null,
+    });
+    await makeAdoptedProgressPlan(root, "good-neighbor", ["task-0001"]);
+    await makeAdoptedProgressPlan(root, "actual-directory", ["task-0001"], "../wrong-plan");
+    const data = await collectDashboardData(root);
+    assert.equal(data.planProgress.length, 2);
+    const invalid = data.planProgress.find((plan) => plan.id === "actual-directory");
+    assert.equal(invalid.currentCategory, "invalid_document");
+    assert.match(invalid.action, /does not match plan directory &quot;actual-directory&quot;|does not match plan directory "actual-directory"/);
+    const section = progressSection(renderDashboard(data));
+    assert.match(section, /actual-directory/);
+    assert.match(section, /does not match plan directory/);
+    assert.match(section, /good-neighbor/);
+    renderedSections.push(section);
+  });
+
+  for (const section of renderedSections) {
+    assert.doesNotMatch(section, /cancell|repository(?:-mutation)? conflict/i);
+    assert.doesNotMatch(section, /<(?:script|button|form|a)\b/i);
+  }
+});
+
 test("renderDashboard opens with a plain-language AIOS introduction and Task/Review/Approval workflow", async (t) => {
   const root = await makeRoot(t);
   const data = await collectDashboardData(root);

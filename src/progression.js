@@ -50,6 +50,12 @@ export async function readPlanOrder({ root, planDirectory, store }) {
   if (typeof metadata.project !== "string" || metadata.project.trim().length === 0) {
     throw new PlanOrderError("PLAN.md must declare a project");
   }
+  const directoryName = path.basename(resolvedPlan);
+  if (metadata.id !== directoryName) {
+    throw new PlanOrderError(
+      `PLAN.md id "${String(metadata.id)}" does not match plan directory "${directoryName}"`,
+    );
+  }
   if (PLACEHOLDER_ID.test(raw)) {
     throw new PlanOrderError(
       "PLAN.md still contains an unadopted P-## placeholder; adopt the plan before progressing it",
@@ -105,6 +111,96 @@ export async function selectNextTask({ store, order }) {
     completed.push(taskId);
   }
   return { completed, next: null };
+}
+
+// Derives the durable, repository-observable state of one adopted plan
+// without invoking a Worker or mutating any document. Dashboard consumers use
+// this so plan ordering, completion, current-state classification, and action
+// text stay in the same core module as live progression.
+export async function derivePlanProgressState({ root, planDirectory, store }) {
+  const resolvedRoot = path.resolve(root);
+  const resolvedPlan = path.resolve(planDirectory);
+  const fallbackPlan = path.basename(resolvedPlan);
+
+  let plan;
+  let order;
+  try {
+    ({ plan, order } = await readPlanOrder({
+      root: resolvedRoot,
+      planDirectory: resolvedPlan,
+      store,
+    }));
+  } catch (error) {
+    return {
+      plan: fallbackPlan,
+      order: [],
+      completed: [],
+      task: null,
+      taskState: null,
+      stopReason: STOP_REASONS.INVALID_DOCUMENT,
+      action: `Fix PLAN.md before running progression: ${error.message}`,
+    };
+  }
+
+  const completed = [];
+  let currentTask = null;
+  for (const taskId of order) {
+    let task;
+    try {
+      task = await store.loadTask(taskId);
+      await store.validateTaskEvidence(task);
+    } catch (error) {
+      const invalid = stopFor(resolvedRoot, plan, completed, taskId, {
+        kind: "halted",
+        category: "invalid_document",
+        reason: error.message,
+      });
+      return { ...invalid, order, taskState: null };
+    }
+
+    if (task.metadata.state === "done") {
+      completed.push(taskId);
+      continue;
+    }
+    currentTask ??= task;
+  }
+
+  if (currentTask === null) {
+    return {
+      plan,
+      order,
+      completed,
+      task: null,
+      taskState: null,
+      stopReason: STOP_REASONS.PLAN_COMPLETE,
+      action: "No action needed: every Task in the plan is done.",
+    };
+  }
+
+  const taskId = currentTask.metadata.id;
+  if (currentTask.metadata.state === "approval") {
+    const approval = stopFor(resolvedRoot, plan, completed, taskId, {
+      kind: "halted",
+      category: "approval_gate",
+    });
+    return { ...approval, order, taskState: currentTask.metadata.state };
+  }
+  if (currentTask.metadata.state === "blocked") {
+    const blocked = stopFor(resolvedRoot, plan, completed, taskId, {
+      kind: "blocked",
+      task: currentTask,
+    });
+    return { ...blocked, order, taskState: currentTask.metadata.state };
+  }
+  return {
+    plan,
+    order,
+    completed,
+    task: taskId,
+    taskState: currentTask.metadata.state,
+    stopReason: null,
+    action: null,
+  };
 }
 
 function stopFor(root, plan, completed, taskId, outcome) {

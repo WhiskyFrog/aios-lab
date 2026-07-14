@@ -62,7 +62,7 @@ test("collectPlanProposals reports fully adopted plans as adopted with no errors
   const result = await collectPlanProposals(root);
   assert.deepEqual(result.errors, []);
   assert.deepEqual(result.plans, [
-    { id: "site-plan", profile: "website", proposalCount: 2, adopted: true },
+    { id: "site-plan", directory: "site-plan", profile: "website", proposalCount: 2, adopted: true },
   ]);
 });
 
@@ -73,7 +73,7 @@ test("collectPlanProposals reports pending plans as not adopted", async (t) => {
   const result = await collectPlanProposals(root);
   assert.deepEqual(result.errors, []);
   assert.deepEqual(result.plans, [
-    { id: "pending-plan", profile: "website", proposalCount: 1, adopted: false },
+    { id: "pending-plan", directory: "pending-plan", profile: "website", proposalCount: 1, adopted: false },
   ]);
 });
 
@@ -94,7 +94,7 @@ test("collectPlanProposals reports an unparsable PLAN.md as a named error withou
 
   const result = await collectPlanProposals(root);
   assert.deepEqual(result.plans, [
-    { id: "good-plan", profile: "website", proposalCount: 1, adopted: true },
+    { id: "good-plan", directory: "good-plan", profile: "website", proposalCount: 1, adopted: true },
   ]);
   assert.equal(result.errors.length, 1);
   assert.equal(result.errors[0].plan, "broken-plan");

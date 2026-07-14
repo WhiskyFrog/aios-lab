@@ -107,6 +107,15 @@ id/verdict with the Review's findings in a collapsible section, and its
 recorded Attempt count; the done section is visually distinguished with a
 checkmark label, not color alone), and a "Plan proposals awaiting adoption"
 section listing each not-yet-adopted plan's id, profile, and proposal count.
+A separate "Plan Progress" section shows every adopted plan's ordered Tasks,
+done count, and current Task. Its current-state labels and operator action are
+derived live from the same progression library used by `aios progress`; only
+durable approval, blocked, and invalid-document states are classified. When a
+Task has no such durable marker, the section may show the latest failed or
+capacity-deferred Worker session in a clearly separate "Last observed"
+historical area, without presenting that possibly stale evidence as current or
+attaching an action to it. Transient cancellation and repository-conflict
+events are intentionally not reconstructed after the command exits.
 A Task in `state: approval` whose decision file `.aios/approvals/<task-id>`
 does not yet exist is flagged with the exact path a human must write
 `approved` or `rejected` to. Tasks, Reviews, and plan documents are loaded

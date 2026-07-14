@@ -2,7 +2,11 @@ import { access, mkdir, readdir } from "node:fs/promises";
 import path from "node:path";
 
 import { atomicReplace, countAttempts, TaskStore } from "./documents.js";
-import { collectPlanProposals, deriveNextActions } from "./plan-dashboard.js";
+import {
+  collectPlanProgress,
+  collectPlanProposals,
+  deriveNextActions,
+} from "./plan-dashboard.js";
 import { SessionLedger } from "./sessions.js";
 
 const TASK_FILE = /^(task-[0-9]{4,})\.md$/;
@@ -82,6 +86,12 @@ export async function collectDashboardData(root) {
   }
 
   const { plans, errors: planErrors } = await collectPlanProposals(root);
+  const planProgress = await collectPlanProgress({
+    root,
+    plans,
+    store,
+    sessions: workerSessions,
+  });
   const nextActions = deriveNextActions({ rows, plans });
 
   return {
@@ -93,6 +103,7 @@ export async function collectDashboardData(root) {
     workerSessions,
     sessionError,
     plans,
+    planProgress,
     planErrors,
     nextActions,
   };
@@ -275,6 +286,79 @@ function renderPlanProposals(data) {
   return `
     <section class="plans-section" aria-labelledby="plans-heading">
       <h2 id="plans-heading">Plan proposals awaiting adoption</h2>
+      ${content}
+    </section>`;
+}
+
+function currentCategoryLabel(category) {
+  const labels = {
+    awaiting_approval: "Awaiting approval",
+    blocked_rejected: "Blocked — rejected",
+    blocked_retry_exhausted: "Blocked — retry limit exhausted",
+    invalid_document: "Invalid document",
+  };
+  return labels[category] ?? category;
+}
+
+function renderPlanProgressCard(plan) {
+  const tasks = plan.order
+    .map((taskId) => {
+      const position = plan.completed.includes(taskId)
+        ? "done"
+        : taskId === plan.currentTask
+          ? "current"
+          : "upcoming";
+      return `<li><code>${escapeHtml(taskId)}</code> <span class="task-position">${escapeHtml(position)}</span></li>`;
+    })
+    .join("\n");
+  const current = plan.complete
+    ? '<p class="plan-complete"><strong>Complete</strong> — every ordered Task is done.</p>'
+    : `<div class="field"><span class="field-label">Current Task</span><span><code>${escapeHtml(
+        plan.currentTask ?? "Unavailable",
+      )}</code>${plan.currentTaskState ? ` (${escapeHtml(plan.currentTaskState)})` : ""}</span></div>`;
+  const durable =
+    plan.currentCategory === null
+      ? ""
+      : `<div class="current-state ${plan.currentCategory === "invalid_document" ? "progress-error" : ""}">
+           <h4>Current state</h4>
+           <p><strong>${escapeHtml(currentCategoryLabel(plan.currentCategory))}</strong></p>
+           <p class="operator-action"><span>Operator action:</span> ${escapeHtml(plan.action)}</p>
+         </div>`;
+  const historical =
+    plan.lastObserved === null
+      ? ""
+      : `<div class="last-observed">
+           <h4>Last observed <span>(historical, not live status)</span></h4>
+           <div class="field"><span class="field-label">Role</span><span>${escapeHtml(plan.lastObserved.role)}</span></div>
+           <div class="field"><span class="field-label">Outcome</span><span>${escapeHtml(plan.lastObserved.outcome)}</span></div>
+           <div class="field"><span class="field-label">Observed at</span><span>${escapeHtml(plan.lastObserved.observedAt)}</span></div>
+         </div>`;
+  return `
+    <article class="plan-progress-card${plan.currentCategory === "invalid_document" ? " error-card" : ""}">
+      <div class="task-header">
+        <h3>${escapeHtml(plan.id)}</h3>
+        <span class="badge ${plan.complete ? "badge-done" : "badge-plan"}">${plan.complete ? "complete" : "in progress"}</span>
+      </div>
+      <div class="field"><span class="field-label">Completed</span><span>${plan.completed.length} / ${plan.order.length}</span></div>
+      ${current}
+      ${durable}
+      ${historical}
+      <div class="plan-order">
+        <h4>Execution order</h4>
+        ${tasks.length === 0 ? '<p class="empty-state">Task order is unavailable.</p>' : `<ol>${tasks}</ol>`}
+      </div>
+    </article>`;
+}
+
+function renderPlanProgress(data) {
+  const content =
+    data.planProgress.length === 0
+      ? '<p class="empty-state">No adopted plans are available.</p>'
+      : `<div class="plan-progress-grid">${data.planProgress.map(renderPlanProgressCard).join("\n")}</div>`;
+  return `
+    <section class="plan-progress-section" aria-labelledby="plan-progress-heading">
+      <h2 id="plan-progress-heading">Plan Progress</h2>
+      <p class="section-note">Current state is derived live from repository documents. Last-observed evidence is historical and may be stale.</p>
       ${content}
     </section>`;
 }
@@ -469,6 +553,27 @@ const STYLE = `
     margin-bottom: 0.5rem;
   }
   .plan-card { border-color: #cfd6df; }
+  .plan-progress-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 360px), 1fr));
+    gap: 1rem;
+  }
+  .plan-progress-card { background: #fff; border: 1px solid #cfd6df; border-radius: 8px; padding: 1rem; }
+  .plan-progress-card h3 { margin: 0; }
+  .plan-progress-card h4 { margin: 0 0 0.5rem; font-size: 0.95rem; }
+  .plan-progress-card .field { align-items: flex-start; gap: 1rem; }
+  .plan-progress-card .field > :last-child { text-align: right; overflow-wrap: anywhere; }
+  .section-note { color: #5b6472; }
+  .current-state, .last-observed, .plan-order { border-top: 1px solid #dde1e7; margin-top: 0.8rem; padding-top: 0.8rem; }
+  .current-state p { margin: 0.35rem 0; }
+  .progress-error { color: #9b1c1c; }
+  .operator-action span { font-weight: 700; }
+  .last-observed { background: #f6f7f9; border: 1px dashed #7b8491; border-radius: 6px; padding: 0.75rem; }
+  .last-observed h4 span { color: #5b6472; font-size: 0.8rem; font-weight: 400; }
+  .plan-complete { color: #166534; }
+  .plan-order ol { margin: 0; padding-left: 1.5rem; }
+  .plan-order li { margin: 0.25rem 0; }
+  .task-position { color: #5b6472; font-size: 0.8rem; text-transform: uppercase; }
   .next-actions-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
   .next-action {
     display: flex;
@@ -542,6 +647,7 @@ ${renderNextActions(data)}
 ${renderUpcomingTasks(data)}
 ${renderCompletedTasks(data)}
 ${renderPlanProposals(data)}
+${renderPlanProgress(data)}
 ${renderErrors(data)}
 ${renderWorkerSessions(data)}
 </main>
