@@ -22,3 +22,23 @@ export {
   RoutingConfigError,
   validateRoutingConfig,
 } from "./routing.js";
+export {
+  decisionKeyString,
+  NoEligibleCandidateError,
+  RoutingPolicyError,
+  selectCandidate,
+  SELECTION_REASON_CODES,
+  validateDecisionKey,
+} from "./routing-policy.js";
+export {
+  DECISION_STATUSES,
+  decisionRecordFromSelection,
+  FAILURE_REASON_CODES,
+  normalizeFailureReason,
+  ROUTING_DECISIONS_SCHEMA,
+  RoutingDecisionLedger,
+  routingDecisionsPath,
+  RoutingLedgerConflictError,
+  RoutingLedgerError,
+  validateDecisionRecord,
+} from "./routing-ledger.js";

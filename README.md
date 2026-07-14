@@ -267,12 +267,12 @@ deliberately separate; orchestration remains out of scope.
 ## Adaptive Routing Contracts (Foundation)
 
 `src/routing.js` defines the configuration and workload-evidence foundation for
-adaptive routing. It does not yet select or launch a model: the current
-`FileAssignmentResolver` remains the execution path for `aios.assignments/v1`,
-with the same re-read, session-ledger, and Role behavior described above.
-`parseExecutionConfig` activates the new foundation only when the input schema
-is explicitly `aios.routing/v1`; no routing decision ledger is written at this
-stage.
+adaptive routing. `src/routing-policy.js` and `src/routing-ledger.js` add the
+pure selection policy and its durable decision record. They do not yet launch a
+model: the current `FileAssignmentResolver` remains the execution path for
+`aios.assignments/v1`, with the same re-read, session-ledger, and Role behavior
+described above. `parseExecutionConfig` activates routing contracts only when
+the input schema is explicitly `aios.routing/v1`.
 
 An `aios.routing/v1` document declares all model information as operator data:
 
@@ -340,6 +340,67 @@ and diagnostics. Supplied Reviews must be valid `aios.review/v1` documents with
 non-empty bodies; supplied sessions must be validated `aios.sessions/v1` ledger
 rows. Invalid history is recorded in diagnostics and forces the high tier rather
 than being ignored.
+
+### Deterministic selection and decision ledger
+
+`selectCandidate` has no I/O, clock, randomness, Worker launch, or model call.
+Its complete input is the validated catalog, normalized workload, exact
+Task/Role/attempt/policy-revision key, prior decision history, and (for review)
+the Implementer decision. Candidate and provider tie breaks use a stable
+codepoint order, so host locale does not affect the result.
+
+The selector first removes disabled, Role-ineligible, previously attempted,
+capability/context-inadequate, over-budget, and below-minimum-tier candidates.
+Planning, unknown or conservative work stays at the configured high tier; only
+a bounded Implementer workload whose lower-tier gates all passed can use its
+lower minimum. A Reviewer is never below the Implementer tier and prefers a
+different provider. When no cross-provider candidate survives, the recorded
+same-provider exception includes the rejected alternatives and their exact gate
+reasons.
+
+After the hard gates, a documented lexicographic tuple prefers a different
+Reviewer provider, then the minimum sufficient tier and capabilities, then
+lower latency and cost. Provider distribution is considered only among
+candidates with the identical best tuple. Finite-window target deficits use
+exact integer/rational arithmetic; the audit form stores reduced numerator and
+denominator strings, avoiding floating-point routing drift. Provider id and
+candidate id resolve exact ties. The returned step, parent step, fallback
+availability, and per-Task escalation usage are explicit and bounded by policy.
+Task/plan hint provenance must identify the current Task or normalized parent,
+exist in the active configuration, and agree field-for-field with the workload.
+The selector recomputes the complete ordered lower-tier rejection list rather
+than trusting a supplied eligibility flag. Reviewer comparison likewise binds
+the supplied Implementer candidate, provider, and tier back to the catalog.
+
+`RoutingDecisionLedger` persists strict `aios.routing-decisions/v1` JSON at
+`.aios/runtime/routing-decisions.json` with atomic replace and snapshot
+compare-and-swap checks. A decision is recorded before dispatch by its exact
+key and step. Re-recording the identical normalized decision is an idempotent
+no-op; changing any recorded field or mixing policy revisions fails closed.
+An exclusive repository-local lock encloses the final snapshot comparison and
+atomic replace, so overlapping writers cannot both pass the comparison; a
+snapshot whose projected fields do not match its raw bytes is also rejected.
+Initial state must be `selected`, dispatch must precede a terminal outcome, and
+an override attaches only before dispatch. State and timestamps move only
+forward, and ledger `updated_at` must equal the latest decision observation.
+
+Ledger rows contain only normalized workload evidence, ordered candidate gate
+results, the choice and fitness tuple, exact distribution evidence, optional
+normalized failure/override data, state, relationships, and caller-supplied
+timestamps. They exclude command argv, environment, Task/prompt bodies,
+credentials, continuation values, and raw provider errors. Diagnostics have a
+small reason-code vocabulary, are length-bounded, and redact common secrets and
+local user paths. Read APIs resolve an exact key, find the latest Task/Role
+decision, count a bounded provider window, and produce a sanitized dashboard
+projection. Missing state is empty; malformed or conflicting state is never
+overwritten automatically.
+
+Provider model ids are bounded identifier-like data, not free-form text. On
+load, the ledger also rechecks workload enums, fixed gate ordering, positive
+distribution targets, provider uniqueness, count totals, exact rational
+deficits, equivalent-provider coverage, winner-change claims, same-provider
+review evidence, and override/choice agreement. A structurally valid JSON file
+with inconsistent audit facts is therefore malformed state, not trusted history.
 
 ## Command Worker
 

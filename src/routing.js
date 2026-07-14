@@ -14,6 +14,7 @@ import { validateSessionLedgerRow } from "./sessions.js";
 import { validateCommand } from "./workers.js";
 
 const IDENTIFIER = /^[a-z0-9][a-z0-9._-]*$/;
+const MODEL_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,119}$/;
 const TASK_SELECTOR = /^(?:\*|task-[0-9]{4,})$/;
 const PLAN_SELECTOR = /^[a-z0-9][a-z0-9-]*$/;
 const ROUTED_ROLES = new Set(["implementer", "reviewer"]);
@@ -177,7 +178,7 @@ function validateCandidates(value, catalogs) {
     return {
       id: nonEmptyString(entry.id, `${label}.id`, IDENTIFIER),
       provider: nonEmptyString(entry.provider, `${label}.provider`, IDENTIFIER),
-      model: nonEmptyString(entry.model, `${label}.model`),
+      model: nonEmptyString(entry.model, `${label}.model`, MODEL_IDENTIFIER),
       tier: nonEmptyString(entry.tier, `${label}.tier`, IDENTIFIER),
       roles,
       command,
