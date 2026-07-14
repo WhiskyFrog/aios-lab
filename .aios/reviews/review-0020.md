@@ -1,0 +1,14 @@
+---
+schema: aios.review/v1
+id: review-0020
+project: aios-lab
+task: task-0018
+attempt: 1
+verdict: pass
+---
+
+# Review of task-0018, Attempt 1
+
+## Findings
+
+All acceptance criteria are met and verified against actual repository state, not just the Attempt's claims. (1) P-01.md flips to `approval: required` with justification tied to the task-0008 engine-surface policy already applied to task-0012/task-0017, and PLAN.md's Contracts bullet mirrors this — verified against src/engine.js that `halted()` uniformly returns `{kind:'halted', task, reason}` at every call site (conflict, worker/capacity failure, cancellation, invalid document), so the proposed additive `category` field with its five stable values (approval_gate, worker_failure, invalid_document, conflict, cancelled) and explicit backward-compatibility boundary (existing kind/task/reason/retryAt unchanged; future enum additions themselves require approval) is precise and mechanically sound. (2) P-03.md's dashboard proposal now splits 'current state' (approval/blocked/invalid-document, always live-derivable from the Task document, each with an operator action) from 'last-observed' session-ledger evidence (worker-failure/capacity-wait, historical only, no operator action), and explicitly excludes cancellation and repository-conflict from the dashboard under any label. I independently verified this against src/sessions.js (OUTCOMES = completed/failed/capacity_deferred only) and workers/human-approver.mjs (emits `schema: aios.result/v1`, not the `aios.worker-execution/v1` WORKER_EXECUTION_SCHEMA that triggers `ledger.record` in src/workers.js), confirming the claim that the approver Role's executions are never written to the ledger. PLAN.md's Assumptions/Risks section and P-04's cross-surface-consistency AC match this split exactly. (3) P-02.md replaces the deferred exit-code policy with a fixed table (0/3/4/5/6/7/64) that I verified against src/cli.js's actual `run` exit codes (0 done, 1 halted, 2 blocked, 64 usage, 75 waiting) — the new codes 3/4/5/6/7 don't collide with run's 1/2/75, and 0/64 are intentionally shared, exactly as claimed. The plan's narrow goal, four-proposal decomposition and ordering, and exclusion of adaptive model routing are all preserved. `node src/cli.js adopt plans/inter-task-progression --check` returns the expected checked result, and `git status --porcelain` before/after confirms it writes nothing; the Verification section records this accurately. `git diff`/`git status` confirm the Implementer touched only plans/inter-task-progression/ — the modified .aios/assignments.json and .aios/tasks/task-0017.md, plus the untracked .aios/approvals/task-0017 and .aios/reviews/review-0019.md, are pre-existing environment state unrelated to this Attempt, not Implementer writes. No constraint violations (no persisted plan-run record, daemon, watcher, scheduler, dependency field, or mutating dashboard control added).

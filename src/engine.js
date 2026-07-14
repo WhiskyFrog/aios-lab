@@ -20,8 +20,37 @@ function defaultSleep(ms, { signal } = {}) {
   return timerSleep(ms, undefined, { signal });
 }
 
-function halted(task, reason) {
-  return { kind: "halted", task, reason };
+function halted(task, reason, category) {
+  return { kind: "halted", task, reason, category };
+}
+
+function haltedDocument(task, reason) {
+  return halted(task, reason, "invalid_document");
+}
+
+function haltedConflict(task, reason) {
+  return halted(task, reason, "conflict");
+}
+
+function haltedCancelled(task, reason) {
+  return halted(task, reason, "cancelled");
+}
+
+function haltedWorker(task, reason) {
+  return halted(task, reason, "worker_failure");
+}
+
+// approval_gate is reserved for the approver Role's own explicit failure
+// Result (no decision file yet, or an invalid one); every other failure that
+// happens to occur while dispatching to the approver Role — a missing
+// Assignment, an execution error, a capacity failure, or a malformed Result —
+// is still a worker_failure.
+function haltedApproverGate(task, reason) {
+  return halted(task, reason, "approval_gate");
+}
+
+function isCancellation(error, signal) {
+  return signal?.aborted === true || error?.name === "AbortError";
 }
 
 function isPositiveInteger(value) {
@@ -42,14 +71,14 @@ function runOptionsError(options) {
 }
 
 function taskChangedWhileExecuting(task) {
-  return halted(
+  return haltedConflict(
     task,
     "Task changed while the Worker was executing; the engine did not overwrite it",
   );
 }
 
 function taskChangedWhileWaiting(task) {
-  return halted(
+  return haltedConflict(
     task,
     "Task changed while waiting for Worker capacity; the engine did not resume it",
   );
@@ -121,7 +150,7 @@ export class LoopEngine {
     const options = { waitForCapacity, maxCapacityWaitMs, maxCapacityPauses };
     const optionError = runOptionsError(options);
     if (optionError !== null) {
-      return halted(task, `Invalid capacity wait option: ${optionError}`);
+      return halted(task, `Invalid capacity wait option: ${optionError}`, "worker_failure");
     }
     let capacityPauses = 0;
     let requestedCapacityWaitMs = 0;
@@ -131,7 +160,7 @@ export class LoopEngine {
         task = await this.store.loadTask(taskId);
         await this.store.validateTaskEvidence(task);
       } catch (error) {
-        return halted(task, error.message);
+        return haltedDocument(task, error.message);
       }
 
       if (task.metadata.state === "done" || task.metadata.state === "blocked") {
@@ -140,7 +169,7 @@ export class LoopEngine {
 
       const role = roleForState(task.metadata.state);
       if (role === null) {
-        return halted(task, `Task state ${task.metadata.state} has no Role`);
+        return haltedDocument(task, `Task state ${task.metadata.state} has no Role`);
       }
 
       if (role === "reviewer") {
@@ -151,10 +180,10 @@ export class LoopEngine {
             currentAttempt(task.metadata),
           );
         } catch (error) {
-          return halted(task, error.message);
+          return haltedDocument(task, error.message);
         }
         if (currentReviews.length > 1) {
-          return halted(
+          return haltedDocument(
             task,
             `Multiple Reviews exist for (${task.metadata.id}, attempt ${currentAttempt(
               task.metadata,
@@ -164,7 +193,7 @@ export class LoopEngine {
         if (currentReviews.length === 1) {
           const orphan = currentReviews[0];
           if (orphan.metadata.project !== task.metadata.project) {
-            return halted(task, "Orphan Review does not match the active Task's project");
+            return haltedDocument(task, "Orphan Review does not match the active Task's project");
           }
           try {
             await this.store.writeTask(
@@ -172,7 +201,10 @@ export class LoopEngine {
               transitionFromReview(task, orphan),
             );
           } catch (error) {
-            return halted(task, `Unable to attach orphan Review: ${error.message}`);
+            const reason = `Unable to attach orphan Review: ${error.message}`;
+            return error instanceof TaskConflictError
+              ? haltedConflict(task, reason)
+              : haltedDocument(task, reason);
           }
           continue;
         }
@@ -182,7 +214,7 @@ export class LoopEngine {
       try {
         worker = await this.assignments.resolve(role);
       } catch (error) {
-        return halted(task, error.message);
+        return haltedWorker(task, error.message);
       }
 
       let rawResult;
@@ -201,7 +233,9 @@ export class LoopEngine {
         }
         if (!(executionError instanceof CapacityDeferredError)) {
           if (executionError !== null) {
-            return halted(task, executionError.message);
+            return isCancellation(executionError, signal)
+              ? haltedCancelled(task, executionError.message)
+              : haltedWorker(task, executionError.message);
           }
           break;
         }
@@ -210,11 +244,14 @@ export class LoopEngine {
         try {
           now = Number(this.clock());
         } catch (error) {
-          return halted(task, `Unable to read the capacity wait clock: ${errorMessage(error)}`);
+          return haltedWorker(
+            task,
+            `Unable to read the capacity wait clock: ${errorMessage(error)}`,
+          );
         }
         const pause = Number.isFinite(now) ? capacityPause(executionError, now) : null;
         if (pause === null) {
-          return halted(task, "Worker returned a stale or malformed capacity reset");
+          return haltedWorker(task, "Worker returned a stale or malformed capacity reset");
         }
 
         if (!waitForCapacity) {
@@ -228,14 +265,14 @@ export class LoopEngine {
 
         capacityPauses += 1;
         if (capacityPauses > maxCapacityPauses) {
-          return halted(
+          return haltedWorker(
             task,
             `Worker capacity pause limit exceeded (${maxCapacityPauses})`,
           );
         }
         requestedCapacityWaitMs += pause.delayMs;
         if (requestedCapacityWaitMs > maxCapacityWaitMs) {
-          return halted(
+          return haltedWorker(
             task,
             `Worker capacity wait limit exceeded (${maxCapacityWaitMs} ms)`,
           );
@@ -251,13 +288,9 @@ export class LoopEngine {
           return taskChangedWhileWaiting(task);
         }
         if (sleepError !== null) {
-          const cancelled = signal?.aborted === true || sleepError?.name === "AbortError";
-          return halted(
-            task,
-            cancelled
-              ? "Worker capacity wait was cancelled"
-              : `Worker capacity wait failed: ${errorMessage(sleepError)}`,
-          );
+          return isCancellation(sleepError, signal)
+            ? haltedCancelled(task, "Worker capacity wait was cancelled")
+            : haltedWorker(task, `Worker capacity wait failed: ${errorMessage(sleepError)}`);
         }
         continuation = pause.continuation;
       }
@@ -268,11 +301,13 @@ export class LoopEngine {
       } catch (error) {
         const reason =
           error instanceof ContractError ? error.message : `Invalid Result: ${error.message}`;
-        return halted(task, reason);
+        return haltedWorker(task, reason);
       }
 
       if (result.status === "failure") {
-        return halted(task, result.payload.reason);
+        return role === "approver"
+          ? haltedApproverGate(task, result.payload.reason)
+          : haltedWorker(task, result.payload.reason);
       }
 
       if (role === "implementer") {
@@ -288,7 +323,10 @@ export class LoopEngine {
           );
           await this.store.writeTask(task, metadata, body);
         } catch (error) {
-          return halted(task, `Unable to persist Implementer Result: ${error.message}`);
+          const reason = `Unable to persist Implementer Result: ${error.message}`;
+          return error instanceof TaskConflictError
+            ? haltedConflict(task, reason)
+            : haltedDocument(task, reason);
         }
         continue;
       }
@@ -298,7 +336,7 @@ export class LoopEngine {
         try {
           review = await this.store.createReview(task, result.payload);
         } catch (error) {
-          return halted(task, `Unable to persist Review: ${error.message}`);
+          return haltedDocument(task, `Unable to persist Review: ${error.message}`);
         }
         try {
           await this.store.writeTask(task, transitionFromReview(task, review));
@@ -307,7 +345,10 @@ export class LoopEngine {
             error instanceof TaskConflictError
               ? "Review persisted as an orphan after a Task conflict"
               : "Review persisted but Task transition failed";
-          return halted(task, `${prefix}: ${error.message}`);
+          const reason = `${prefix}: ${error.message}`;
+          return error instanceof TaskConflictError
+            ? haltedConflict(task, reason)
+            : haltedDocument(task, reason);
         }
         continue;
       }
@@ -324,7 +365,10 @@ export class LoopEngine {
         await this.store.writeTask(task, metadata);
       } catch (error) {
         const reason = error instanceof StoreError ? error.message : String(error);
-        return halted(task, `Unable to persist approval decision: ${reason}`);
+        const message = `Unable to persist approval decision: ${reason}`;
+        return error instanceof TaskConflictError
+          ? haltedConflict(task, message)
+          : haltedDocument(task, message);
       }
     }
   }

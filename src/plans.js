@@ -83,7 +83,7 @@ function nonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0;
 }
 
-function markdownSection(body, heading) {
+export function markdownSection(body, heading) {
   const match = new RegExp(`^## ${heading}[ \\t]*$`, "m").exec(body);
   if (!match) {
     return null;

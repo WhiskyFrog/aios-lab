@@ -346,6 +346,7 @@ test("a failure Result halts with Task bytes and retry unchanged", async (t) => 
 
   assert.equal(outcome.kind, "halted");
   assert.match(outcome.reason, /could not complete/);
+  assert.equal(outcome.category, "worker_failure");
   assert.equal(await readFile(taskPath, "utf8"), before);
 });
 
@@ -357,6 +358,7 @@ test("a missing Assignment halts before invoking any Worker", async (t) => {
   const outcome = await new LoopEngine({ root, assignments }).run(TASK_ID);
 
   assert.equal(outcome.kind, "halted");
+  assert.equal(outcome.category, "worker_failure");
   assert.match(outcome.reason, /No Worker is assigned/);
   assert.deepEqual(assignments.resolutions, ["implementer"]);
   assert.equal(await readFile(taskPath, "utf8"), before);
@@ -420,6 +422,7 @@ test("duplicate orphan Reviews halt without choosing one", async (t) => {
 
   assert.equal(outcome.kind, "halted");
   assert.match(outcome.reason, /Multiple Reviews/);
+  assert.equal(outcome.category, "invalid_document");
   assert.deepEqual(assignments.resolutions, []);
   assert.equal(await readFile(taskPath, "utf8"), before);
 });
@@ -460,9 +463,56 @@ test("a Task mutation during Worker execution is preserved and halts projection"
 
   assert.equal(outcome.kind, "halted");
   assert.match(outcome.reason, /changed while the Worker was executing/);
+  assert.equal(outcome.category, "conflict");
   const stored = await readFile(taskPath, "utf8");
   assert.equal(stored, `${mutatingWorker.calls[0].raw}\n`);
   assert.doesNotMatch(stored, /### Attempt 1/);
+});
+
+test("an approver Result failure halts with the approval_gate category", async (t) => {
+  const metadata = taskMetadata({
+    state: "approval",
+    approval: "required",
+    last_review: "review-0042",
+  });
+  const { root } = await createRepository(t, metadata, 1);
+  await seedReview(root, { id: "review-0042", verdict: "pass" });
+  const approver = new ScriptedWorker(
+    result(
+      "approver",
+      { reason: 'awaiting human decision: create .aios/approvals/task-9000 containing exactly "approved" or "rejected"' },
+      { status: "failure" },
+    ),
+  );
+
+  const outcome = await new LoopEngine({
+    root,
+    assignments: new TrackingResolver({ approver }),
+  }).run(TASK_ID);
+
+  assert.equal(outcome.kind, "halted");
+  assert.equal(outcome.category, "approval_gate");
+});
+
+test("cancellation during active Worker execution halts with the cancelled category", async (t) => {
+  const { root } = await createRepository(t);
+  const controller = new AbortController();
+  const worker = {
+    async execute() {
+      controller.abort();
+      const error = new Error("aborted");
+      error.name = "AbortError";
+      throw error;
+    },
+  };
+
+  const outcome = await new LoopEngine({
+    root,
+    assignments: new TrackingResolver({ implementer: worker }),
+  }).run(TASK_ID, { signal: controller.signal });
+
+  assert.equal(outcome.kind, "halted");
+  assert.equal(outcome.category, "cancelled");
 });
 
 test("a CRLF-materialized checkout keeps framed Attempts readable and finishes", async (t) => {
