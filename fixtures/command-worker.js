@@ -1,6 +1,6 @@
 import process from "node:process";
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import { existsSync } from "node:fs";
 
 const mode = process.argv[2];
@@ -79,6 +79,64 @@ function workerExecution({
 if (mode === "auto-loop") {
   const role = process.env.AIOS_ROLE;
   process.stdout.write(JSON.stringify(result(role)));
+} else if (mode === "fresh-loop") {
+  const role = process.env.AIOS_ROLE;
+  if (process.env.AIOS_WORKER_CONTINUATION) {
+    process.stderr.write("continuation crossed candidates");
+    process.exitCode = 9;
+  } else {
+    process.stdout.write(JSON.stringify(result(role)));
+  }
+} else if (mode === "corrected-loop") {
+  const role = process.env.AIOS_ROLE;
+  const value = result(role);
+  if (role === "implementer") {
+    value.payload.summary = "Implemented the requested correction.";
+    value.payload.verification = "Verified the corrected behavior.";
+  }
+  process.stdout.write(JSON.stringify(value));
+} else if (mode === "review-by-attempt") {
+  const role = process.env.AIOS_ROLE;
+  if (role !== "reviewer") {
+    process.stdout.write(JSON.stringify(result(role)));
+  } else {
+    const attempts = [...taskDocument.matchAll(/^### Attempt /gm)].length;
+    process.stdout.write(
+      JSON.stringify({
+        schema: "aios.result/v1",
+        task: process.env.AIOS_TASK_ID,
+        role,
+        status: "success",
+        payload:
+          attempts === 1
+            ? {
+                verdict: "changes_requested",
+                findings: "A stronger implementation is required.",
+              }
+            : { verdict: "pass", findings: "The corrected implementation passes." },
+      }),
+    );
+  }
+} else if (mode === "verification-failure" || mode === "context-failure") {
+  const role = process.env.AIOS_ROLE;
+  process.stdout.write(
+    JSON.stringify({
+      schema: "aios.result/v1",
+      task: process.env.AIOS_TASK_ID,
+      role,
+      status: "failure",
+      payload: {
+        reason:
+          mode === "verification-failure"
+            ? "Objective verification failed."
+            : "The available context is insufficient.",
+        failure_kind:
+          mode === "verification-failure"
+            ? "verification_failed"
+            : "context_insufficient",
+      },
+    }),
+  );
 } else if (mode === "repeat-loop") {
   const role = process.env.AIOS_ROLE;
   process.stdout.write(
@@ -189,6 +247,14 @@ if (mode === "auto-loop") {
   );
 } else if (mode === "nonzero") {
   process.stderr.write("fixture failure");
+  process.exitCode = 7;
+} else if (mode === "mutate-nonzero") {
+  appendFileSync(
+    `.aios/tasks/${process.env.AIOS_TASK_ID}.md`,
+    "\n",
+    "utf8",
+  );
+  process.stderr.write("fixture changed the Task before failing");
   process.exitCode = 7;
 } else if (mode === "malformed") {
   process.stdout.write('{"schema":"aios.result/v1"}\nnot-json');

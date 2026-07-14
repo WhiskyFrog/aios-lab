@@ -9,7 +9,9 @@ import { SessionLedger } from "../src/sessions.js";
 import {
   CapacityDeferredError,
   CommandWorker,
+  ProviderFailureError,
   WorkerError,
+  WorkerTimeoutError,
   workerEnvironment,
 } from "../src/workers.js";
 
@@ -67,6 +69,7 @@ test("CommandWorker rejects a non-zero process exit", async () => {
     worker.execute(task),
     (error) =>
       error instanceof WorkerError &&
+      error instanceof ProviderFailureError &&
       /code 7/.test(error.message) &&
       /fixture failure/.test(error.message),
   );
@@ -167,6 +170,7 @@ test("CommandWorker force-terminates a timed-out process", async () => {
     worker.execute(task),
     (error) =>
       error instanceof WorkerError &&
+      error instanceof WorkerTimeoutError &&
       /timed out/.test(error.message),
   );
 });

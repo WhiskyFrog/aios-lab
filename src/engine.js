@@ -213,121 +213,167 @@ export class LoopEngine {
 
       let worker;
       try {
-        worker = await this.assignments.resolve(role);
+        const routingPolicyRevision =
+          typeof this.assignments.policyRevision === "function"
+            ? await this.assignments.policyRevision()
+            : null;
+        const reviews =
+          routingPolicyRevision === null
+            ? []
+            : (await this.store.listReviews()).filter(
+                (review) => review.metadata.task === task.metadata.id,
+              );
+        const dispatchContext = Object.freeze({
+          task,
+          role,
+          attempt: currentAttempt(task.metadata),
+          reviewGeneration: task.metadata.last_review,
+          reviews: Object.freeze([...reviews]),
+          runOptions: Object.freeze({ ...options }),
+          routingPolicyRevision,
+        });
+        worker = await this.assignments.resolve(role, dispatchContext);
       } catch (error) {
         return haltedWorker(task, error.message);
       }
 
-      let rawResult;
-      let continuation = null;
-
-      while (true) {
-        let executionError = null;
-        try {
-          rawResult = await worker.execute(task, { continuation, signal });
-        } catch (error) {
-          executionError = error;
-        }
-
-        if (!(await this.store.taskIsUnchanged(task))) {
-          return taskChangedWhileExecuting(task);
-        }
-        if (!(executionError instanceof CapacityDeferredError)) {
-          if (executionError !== null) {
-            return isCancellation(executionError, signal)
-              ? haltedCancelled(task, executionError.message)
-              : haltedWorker(task, executionError.message);
-          }
-          break;
-        }
-
-        let now;
-        try {
-          now = Number(this.clock());
-        } catch (error) {
-          return haltedWorker(
-            task,
-            `Unable to read the capacity wait clock: ${errorMessage(error)}`,
-          );
-        }
-        const pause = Number.isFinite(now) ? capacityPause(executionError, now) : null;
-        if (pause === null) {
-          return haltedWorker(task, "Worker returned a stale or malformed capacity reset");
-        }
-
-        if (!waitForCapacity) {
-          return {
-            kind: "waiting",
-            task,
-            reason: executionError.message,
-            retryAt: pause.retryAt,
-          };
-        }
-
-        capacityPauses += 1;
-        if (capacityPauses > maxCapacityPauses) {
-          return haltedWorker(
-            task,
-            `Worker capacity pause limit exceeded (${maxCapacityPauses})`,
-          );
-        }
-        requestedCapacityWaitMs += pause.delayMs;
-        if (requestedCapacityWaitMs > maxCapacityWaitMs) {
-          return haltedWorker(
-            task,
-            `Worker capacity wait limit exceeded (${maxCapacityWaitMs} ms)`,
-          );
-        }
-
-        let sleepError = null;
-        try {
-          await this.sleep(pause.delayMs, { signal });
-        } catch (error) {
-          sleepError = error;
-        }
-        if (!(await this.store.taskIsUnchanged(task))) {
-          return taskChangedWhileWaiting(task);
-        }
-        if (sleepError !== null) {
-          return isCancellation(sleepError, signal)
-            ? haltedCancelled(task, "Worker capacity wait was cancelled")
-            : haltedWorker(task, `Worker capacity wait failed: ${errorMessage(sleepError)}`);
-        }
-        continuation = pause.continuation;
-      }
-
       let result;
-      try {
-        result = validateResult(rawResult, task.metadata, role);
-      } catch (error) {
-        const reason =
-          error instanceof ContractError ? error.message : `Invalid Result: ${error.message}`;
-        return haltedWorker(task, reason);
-      }
+      dispatchAction: while (true) {
+        let rawResult;
+        let continuation = null;
 
-      if (result.status === "failure") {
-        return role === "approver"
-          ? haltedApproverGate(task, result.payload.reason)
-          : haltedWorker(task, result.payload.reason);
+        while (true) {
+          let executionError = null;
+          try {
+            rawResult = await worker.execute(task, { continuation, signal });
+          } catch (error) {
+            executionError = error;
+          }
+
+          if (!(await this.store.taskIsUnchanged(task))) {
+            return taskChangedWhileExecuting(task);
+          }
+          if (!(executionError instanceof CapacityDeferredError)) {
+            if (executionError !== null) {
+              return isCancellation(executionError, signal)
+                ? haltedCancelled(task, executionError.message)
+                : haltedWorker(task, executionError.message);
+            }
+            break;
+          }
+
+          let now;
+          try {
+            now = Number(this.clock());
+          } catch (error) {
+            return haltedWorker(
+              task,
+              `Unable to read the capacity wait clock: ${errorMessage(error)}`,
+            );
+          }
+          const pause = Number.isFinite(now) ? capacityPause(executionError, now) : null;
+          if (pause === null) {
+            return haltedWorker(task, "Worker returned a stale or malformed capacity reset");
+          }
+
+          if (!waitForCapacity) {
+            return {
+              kind: "waiting",
+              task,
+              reason: executionError.message,
+              retryAt: pause.retryAt,
+            };
+          }
+
+          capacityPauses += 1;
+          if (capacityPauses > maxCapacityPauses) {
+            return haltedWorker(
+              task,
+              `Worker capacity pause limit exceeded (${maxCapacityPauses})`,
+            );
+          }
+          requestedCapacityWaitMs += pause.delayMs;
+          if (requestedCapacityWaitMs > maxCapacityWaitMs) {
+            return haltedWorker(
+              task,
+              `Worker capacity wait limit exceeded (${maxCapacityWaitMs} ms)`,
+            );
+          }
+
+          let sleepError = null;
+          try {
+            await this.sleep(pause.delayMs, { signal });
+          } catch (error) {
+            sleepError = error;
+          }
+          if (!(await this.store.taskIsUnchanged(task))) {
+            return taskChangedWhileWaiting(task);
+          }
+          if (sleepError !== null) {
+            return isCancellation(sleepError, signal)
+              ? haltedCancelled(task, "Worker capacity wait was cancelled")
+              : haltedWorker(task, `Worker capacity wait failed: ${errorMessage(sleepError)}`);
+          }
+          continuation = pause.continuation;
+        }
+
+        try {
+          result = validateResult(rawResult, task.metadata, role);
+        } catch (error) {
+          const reason =
+            error instanceof ContractError ? error.message : `Invalid Result: ${error.message}`;
+          if (typeof worker.rejectResult === "function") {
+            try {
+              await worker.rejectResult(reason);
+            } catch (ledgerError) {
+              return haltedWorker(
+                task,
+                `Unable to record rejected routed Result: ${errorMessage(ledgerError)}`,
+              );
+            }
+          }
+          return haltedWorker(task, reason);
+        }
+
+        if (result.status === "failure") {
+          return role === "approver"
+            ? haltedApproverGate(task, result.payload.reason)
+            : haltedWorker(task, result.payload.reason);
+        }
+
+        if (role === "implementer") {
+          const previousAttempt = currentAttempt(task.metadata) - 1;
+          if (
+            previousAttempt > 0 &&
+            repeatsAttemptEvidence(
+              task.body,
+              previousAttempt,
+              result.payload.summary,
+              result.payload.verification,
+            )
+          ) {
+            if (typeof worker.requestRecovery === "function") {
+              worker.requestRecovery("repeated_evidence");
+              continue dispatchAction;
+            }
+            return haltedWorker(
+              task,
+              `Implementer repeated the evidence from Attempt ${previousAttempt}; ` +
+                "submit evidence that describes the actual correction before retrying",
+            );
+          }
+        }
+        if (typeof worker.accept === "function") {
+          try {
+            await worker.accept();
+          } catch (error) {
+            return haltedWorker(task, `Unable to finalize routed dispatch: ${errorMessage(error)}`);
+          }
+        }
+        break;
       }
 
       if (role === "implementer") {
-        const previousAttempt = currentAttempt(task.metadata) - 1;
-        if (
-          previousAttempt > 0 &&
-          repeatsAttemptEvidence(
-            task.body,
-            previousAttempt,
-            result.payload.summary,
-            result.payload.verification,
-          )
-        ) {
-          return haltedWorker(
-            task,
-            `Implementer repeated the evidence from Attempt ${previousAttempt}; ` +
-              "submit evidence that describes the actual correction before retrying",
-          );
-        }
         const metadata = structuredClone(task.metadata);
         metadata.state = "review";
         let body;

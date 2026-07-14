@@ -124,6 +124,30 @@ test("validatePayload accepts a failure_reason reply for any role", () => {
   );
 });
 
+test("validatePayload accepts only the two structured recoverable failure kinds", () => {
+  assert.equal(
+    validatePayload("implementer", {
+      failure_kind: "verification_failed",
+      failure_reason: "tests failed",
+    }),
+    null,
+  );
+  assert.equal(
+    validatePayload("reviewer", {
+      failure_kind: "context_insufficient",
+      failure_reason: "missing context",
+    }),
+    null,
+  );
+  assert.match(
+    validatePayload("implementer", {
+      failure_kind: "provider_failure",
+      failure_reason: "do not infer this",
+    }),
+    /failure_kind must be verification_failed or context_insufficient/,
+  );
+});
+
 test("validatePayload rejects an empty failure_reason", () => {
   assert.match(
     validatePayload("reviewer", { failure_reason: "   " }),

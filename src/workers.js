@@ -35,6 +35,20 @@ export class CapacityDeferredError extends WorkerError {
   }
 }
 
+export class WorkerTimeoutError extends WorkerError {
+  constructor(message, options = undefined) {
+    super(message, options);
+    this.name = "WorkerTimeoutError";
+  }
+}
+
+export class ProviderFailureError extends WorkerError {
+  constructor(message, options = undefined) {
+    super(message, options);
+    this.name = "ProviderFailureError";
+  }
+}
+
 export function terminateProcessTree(child) {
   if (!child.pid) {
     return Promise.resolve();
@@ -135,9 +149,11 @@ export class CommandWorker {
     this.timeoutMs = timeoutMs;
     this.outputLimit = outputLimit;
     this.ledger = ledger;
+    this.lastExecution = null;
   }
 
   async execute(task, { continuation = null, signal = undefined } = {}) {
+    this.lastExecution = null;
     const role = roleForState(task.metadata.state);
     if (role === null) {
       throw new WorkerError(`Task state ${task.metadata.state} has no active Role`);
@@ -216,7 +232,11 @@ export class CommandWorker {
       child.once("error", (error) => {
         clearTimeout(timer);
         signal?.removeEventListener("abort", abort);
-        reject(new WorkerError(`Unable to start Worker: ${error.message}`, { cause: error }));
+        reject(
+          new ProviderFailureError(`Unable to start Worker: ${error.message}`, {
+            cause: error,
+          }),
+        );
       });
 
       child.once("close", async (code, exitSignal) => {
@@ -228,17 +248,23 @@ export class CommandWorker {
           return;
         }
         if (timedOut) {
-          reject(new WorkerError(`Worker timed out after ${this.timeoutMs} ms`));
+          reject(
+            new WorkerTimeoutError(`Worker timed out after ${this.timeoutMs} ms`),
+          );
           return;
         }
         if (exceededLimit) {
-          reject(new WorkerError("Worker output exceeded the configured limit"));
+          reject(
+            new ProviderFailureError(
+              "Worker output exceeded the configured limit",
+            ),
+          );
           return;
         }
         if (code !== 0) {
           const detail = stderr.trim();
           reject(
-            new WorkerError(
+            new ProviderFailureError(
               `Worker exited with code ${String(code)}${
                 exitSignal ? ` (${exitSignal})` : ""
               }${detail ? `: ${detail}` : ""}`,
@@ -249,16 +275,21 @@ export class CommandWorker {
 
         const output = stdout.trim();
         if (output.length === 0) {
-          reject(new WorkerError("Worker returned an empty stdout Result"));
+          reject(
+            new ProviderFailureError("Worker returned an empty stdout Result"),
+          );
           return;
         }
         let parsed;
         try {
           parsed = JSON.parse(output);
         } catch (error) {
-          reject(new WorkerError("Worker stdout must be exactly one JSON Result", {
-            cause: error,
-          }));
+          reject(
+            new ProviderFailureError(
+              "Worker stdout must be exactly one JSON Result",
+              { cause: error },
+            ),
+          );
           return;
         }
 
@@ -283,12 +314,19 @@ export class CommandWorker {
           }
         } catch (error) {
           reject(
-            new WorkerError(`Invalid Worker execution envelope: ${error.message}`, {
-              cause: error,
-            }),
+            new ProviderFailureError(
+              `Invalid Worker execution envelope: ${error.message}`,
+              { cause: error },
+            ),
           );
           return;
         }
+
+        this.lastExecution = Object.freeze({
+          sessionId: execution.session.id,
+          model: execution.session.model,
+          outcome: execution.session.outcome,
+        });
 
         if (execution.deferred !== null) {
           reject(
@@ -342,21 +380,55 @@ export class FileAssignmentResolver {
     this.ledger =
       ledger ??
       new SessionLedger(path.join(this.cwd, ".aios", "runtime", "sessions.json"));
+    this.routedResolver = null;
+    this.preparedConfig = null;
   }
 
-  async resolve(role) {
+  async policyRevision() {
+    const { loadExecutionConfig } = await import("./routing.js");
+    const loaded = await loadExecutionConfig(this.configPath);
+    this.preparedConfig = loaded;
+    if (loaded.kind !== "routing") {
+      return null;
+    }
+    const { routingPolicyRevision } = await import("./routing-dispatch.js");
+    return routingPolicyRevision(loaded.config);
+  }
+
+  async resolve(role, context = undefined) {
     if (!ROLES.has(role)) {
       throw new AssignmentError(`Unknown Role ${role}`);
     }
 
     let config;
-    try {
-      config = JSON.parse(await readFile(this.configPath, "utf8"));
-    } catch (error) {
-      throw new AssignmentError(
-        `Unable to read Assignment config ${this.configPath}`,
-        { cause: error },
-      );
+    if (this.preparedConfig !== null) {
+      config = this.preparedConfig.config;
+      this.preparedConfig = null;
+    } else {
+      try {
+        config = JSON.parse(await readFile(this.configPath, "utf8"));
+      } catch (error) {
+        throw new AssignmentError(
+          `Unable to read Assignment config ${this.configPath}`,
+          { cause: error },
+        );
+      }
+    }
+    if (config?.schema === "aios.routing/v1") {
+      if (role === "approver") {
+        return new CommandWorker([process.execPath, "workers/human-approver.mjs"], {
+          cwd: this.cwd,
+          timeoutMs: this.timeoutMs,
+          ledger: this.ledger,
+        });
+      }
+      const { RoutedAssignmentResolver } = await import("./routing-dispatch.js");
+      this.routedResolver ??= new RoutedAssignmentResolver(this.configPath, {
+        cwd: this.cwd,
+        timeoutMs: this.timeoutMs,
+        ledger: this.ledger,
+      });
+      return this.routedResolver.resolve(role, context);
     }
     if (!hasExactKeys(config, ["schema", "assignments"])) {
       throw new AssignmentError(

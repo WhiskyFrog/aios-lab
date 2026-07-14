@@ -7,6 +7,7 @@ import process from "node:process";
 
 const VERDICTS = new Set(["pass", "changes_requested"]);
 const DECISIONS = new Set(["approved", "rejected"]);
+const FAILURE_KINDS = new Set(["verification_failed", "context_insufficient"]);
 
 const HARD_RULES = [
   "Hard rules:",
@@ -20,7 +21,8 @@ const REPLY_RULES = (shape) =>
   [
     "When finished, reply with ONLY one JSON object - no markdown fences, no other text:",
     shape,
-    'If you cannot complete the work, reply instead with: {"failure_reason":"<why>"}',
+    'If you cannot complete the work, reply instead with: {"failure_reason":"<why>"}.',
+    'For an objectively detected verification or context failure, you may add exactly "failure_kind":"verification_failed" or "failure_kind":"context_insufficient".',
   ].join("\n");
 
 export function rolePrompt(role, taskDocument) {
@@ -151,10 +153,16 @@ export function validatePayload(role, payload) {
     return "the reply is not a JSON object";
   }
   const keys = Object.keys(payload).sort();
-  if (keys.length === 1 && keys[0] === "failure_reason") {
-    return nonEmptyString(payload.failure_reason)
+  if (
+    keys.join(",") === "failure_reason" ||
+    keys.join(",") === "failure_kind,failure_reason"
+  ) {
+    if (!nonEmptyString(payload.failure_reason)) {
+      return "failure_reason must be a non-empty string";
+    }
+    return !Object.hasOwn(payload, "failure_kind") || FAILURE_KINDS.has(payload.failure_kind)
       ? null
-      : "failure_reason must be a non-empty string";
+      : "failure_kind must be verification_failed or context_insufficient";
   }
   if (role === "implementer") {
     if (keys.join(",") !== "summary,verification") {

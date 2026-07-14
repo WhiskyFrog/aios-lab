@@ -446,6 +446,43 @@ test("Assignments are resolved again after each state transition", async (t) => 
   assert.equal(replacementReviewer.calls.length, 1);
 });
 
+test("Role resolution receives an immutable backward-compatible dispatch context", async (t) => {
+  const { root } = await createRepository(t);
+  const contexts = [];
+  class ContextResolver extends StaticAssignmentResolver {
+    async resolve(role, context) {
+      contexts.push(context);
+      return super.resolve(role);
+    }
+  }
+  const assignments = new ContextResolver({
+    implementer: new ScriptedWorker(implementation("context")),
+    reviewer: new ScriptedWorker(review("pass")),
+  });
+
+  const outcome = await new LoopEngine({ root, assignments }).run(TASK_ID);
+
+  assert.equal(outcome.kind, "done");
+  assert.equal(contexts.length, 2);
+  assert.deepEqual(
+    contexts.map(({ role, attempt, routingPolicyRevision }) => ({
+      role,
+      attempt,
+      routingPolicyRevision,
+    })),
+    [
+      { role: "implementer", attempt: 1, routingPolicyRevision: null },
+      { role: "reviewer", attempt: 1, routingPolicyRevision: null },
+    ],
+  );
+  for (const context of contexts) {
+    assert.equal(Object.isFrozen(context), true);
+    assert.equal(Object.isFrozen(context.task), true);
+    assert.equal(Object.isFrozen(context.reviews), true);
+    assert.equal(Object.isFrozen(context.runOptions), true);
+  }
+});
+
 test("an orphan Review is attached without invoking or resolving Reviewer", async (t) => {
   const metadata = taskMetadata({ state: "review" });
   const { root, store } = await createRepository(t, metadata, 1);
@@ -631,6 +668,42 @@ test("strict Result validation rejects unknown fields without changing Task", as
   assert.equal(outcome.kind, "halted");
   assert.match(outcome.reason, /must contain exactly/);
   assert.equal(await readFile(taskPath, "utf8"), before);
+});
+
+test("failure_kind is optional but closed to the recoverable Result vocabulary", () => {
+  const metadata = taskMetadata();
+  const base = {
+    schema: "aios.result/v1",
+    task: TASK_ID,
+    role: "implementer",
+    status: "failure",
+  };
+  assert.equal(
+    validateResult(
+      {
+        ...base,
+        payload: {
+          reason: "objective checks failed",
+          failure_kind: "verification_failed",
+        },
+      },
+      metadata,
+      "implementer",
+    ).payload.failure_kind,
+    "verification_failed",
+  );
+  assert.throws(
+    () =>
+      validateResult(
+        {
+          ...base,
+          payload: { reason: "unknown", failure_kind: "provider_failure" },
+        },
+        metadata,
+        "implementer",
+      ),
+    /unknown value/,
+  );
 });
 
 test("a capacity deferral returns waiting without changing Task state or retry", async (t) => {

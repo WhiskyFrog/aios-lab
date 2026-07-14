@@ -15,6 +15,10 @@ const APPROVAL_STATES = new Set([
 
 const ROLES = new Set(["implementer", "reviewer", "approver"]);
 const REVIEW_VERDICTS = new Set(["pass", "changes_requested"]);
+const RECOVERABLE_FAILURE_KINDS = new Set([
+  "verification_failed",
+  "context_insufficient",
+]);
 
 const STATE_ROLES = Object.freeze({
   implement: "implementer",
@@ -247,8 +251,21 @@ export function validateResult(value, task, expectedRole) {
   }
 
   if (value.status === "failure") {
-    requireExactKeys(value.payload, ["reason"], "Failure payload");
+    const keys = Object.keys(value.payload ?? {}).sort().join(",");
+    if (keys !== "reason" && keys !== "failure_kind,reason") {
+      throw new ContractError(
+        "Failure payload must contain reason and optional failure_kind",
+      );
+    }
     requireNonEmptyString(value.payload.reason, "Failure reason");
+    if (
+      Object.hasOwn(value.payload, "failure_kind") &&
+      !RECOVERABLE_FAILURE_KINDS.has(value.payload.failure_kind)
+    ) {
+      throw new ContractError(
+        `Failure kind has an unknown value: ${String(value.payload.failure_kind)}`,
+      );
+    }
     return value;
   }
 

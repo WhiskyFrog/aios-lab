@@ -42,8 +42,26 @@ export const FAILURE_REASON_CODES = Object.freeze([
   "context_failure",
   "operator_override",
   "no_eligible_candidate",
+  "provider_failure",
+  "verification_failed",
+  "context_insufficient",
+  "repeated_evidence",
+  "worker_reported_failure",
+  "invalid_result",
+  "routing_exhausted",
+]);
+export const ROUTING_EVENT_KINDS = Object.freeze([
+  "launch",
+  "capacity_pause",
+  "failure",
+  "fallback",
+  "escalation",
+  "completion",
+  "exhausted",
 ]);
 const FAILURE_CODES = new Set(FAILURE_REASON_CODES);
+const EVENT_KINDS = new Set(ROUTING_EVENT_KINDS);
+const EVENTS_WITHOUT_REASON = new Set(["launch", "completion"]);
 const GATE_CODES = new Set(SELECTION_REASON_CODES);
 const DIAGNOSTIC_LIMIT = 240;
 const SOURCE_LABEL_LIMIT = 120;
@@ -701,25 +719,75 @@ function validateOverride(value, label) {
   return { candidate: value.candidate, source: value.source };
 }
 
+function validateEvents(value, label, recordedAt) {
+  if (!Array.isArray(value)) {
+    fail(label, "must be an array");
+  }
+  let previousAt = recordedAt;
+  return value.map((event, index) => {
+    const eventLabel = `${label}[${index}]`;
+    exactKeys(
+      event,
+      ["sequence", "kind", "reason", "session_id", "observed_at"],
+      eventLabel,
+    );
+    if (event.sequence !== index) {
+      fail(`${eventLabel}.sequence`, "must be contiguous and zero-based");
+    }
+    enumValue(event.kind, EVENT_KINDS, `${eventLabel}.kind`);
+    const reason = validateReason(event.reason, `${eventLabel}.reason`);
+    if (EVENTS_WITHOUT_REASON.has(event.kind) !== (reason === null)) {
+      fail(
+        `${eventLabel}.reason`,
+        EVENTS_WITHOUT_REASON.has(event.kind)
+          ? "must be null for launch and completion"
+          : "must classify this routing event",
+      );
+    }
+    if (event.session_id !== null) {
+      boundedLabel(event.session_id, `${eventLabel}.session_id`, SOURCE_LABEL_LIMIT);
+    }
+    const observedAt = timestamp(event.observed_at, `${eventLabel}.observed_at`);
+    if (observedAt < previousAt) {
+      fail(`${eventLabel}.observed_at`, "cannot move backward");
+    }
+    previousAt = observedAt;
+    return {
+      sequence: event.sequence,
+      kind: event.kind,
+      reason,
+      session_id: event.session_id,
+      observed_at: observedAt,
+    };
+  });
+}
+
 export function validateDecisionRecord(value, label = "Routing decision") {
+  if (!isObject(value)) {
+    fail(label, "must be an object");
+  }
+  const decisionFields = [
+    "key",
+    "step",
+    "parent_step",
+    "reason",
+    "workload",
+    "considered",
+    "chosen",
+    "fitness",
+    "distribution",
+    "same_provider_review",
+    "override",
+    "events",
+    "status",
+    "recorded_at",
+    "observed_at",
+  ];
   exactKeys(
     value,
-    [
-      "key",
-      "step",
-      "parent_step",
-      "reason",
-      "workload",
-      "considered",
-      "chosen",
-      "fitness",
-      "distribution",
-      "same_provider_review",
-      "override",
-      "status",
-      "recorded_at",
-      "observed_at",
-    ],
+    Object.hasOwn(value, "events")
+      ? decisionFields
+      : decisionFields.filter((field) => field !== "events"),
     label,
   );
   const key = validateDecisionKey(value.key);
@@ -833,13 +901,17 @@ export function validateDecisionRecord(value, label = "Routing decision") {
   if (override !== null && override.candidate !== value.chosen.candidate) {
     fail(`${label}.override.candidate`, "must match the chosen candidate");
   }
+  const recordedAt = timestamp(value.recorded_at, `${label}.recorded_at`);
+  const events = validateEvents(value.events ?? [], `${label}.events`, recordedAt);
   if (!Object.hasOwn(STATUS_RANK, value.status)) {
     fail(`${label}.status`, `has an unknown value: ${String(value.status)}`);
   }
-  const recordedAt = timestamp(value.recorded_at, `${label}.recorded_at`);
   const observedAt = timestamp(value.observed_at, `${label}.observed_at`);
   if (observedAt < recordedAt) {
     fail(`${label}.observed_at`, "cannot be before recorded_at");
+  }
+  if (events.length > 0 && events[events.length - 1].observed_at !== observedAt) {
+    fail(`${label}.observed_at`, "must match the latest routing event");
   }
   return {
     key,
@@ -853,6 +925,7 @@ export function validateDecisionRecord(value, label = "Routing decision") {
     distribution: structuredClone(value.distribution),
     same_provider_review: structuredClone(value.same_provider_review),
     override,
+    events,
     status: value.status,
     recorded_at: recordedAt,
     observed_at: observedAt,
@@ -886,6 +959,7 @@ export function decisionRecordFromSelection(
     distribution: structuredClone(selection.distribution),
     same_provider_review: structuredClone(selection.same_provider_review),
     override,
+    events: [],
     status,
     recorded_at,
     observed_at: observed_at ?? recorded_at,
@@ -1152,6 +1226,93 @@ export class RoutingDecisionLedger {
       schema: ROUTING_DECISIONS_SCHEMA,
       updated_at: updatedAt,
       decisions: [...snapshot.decisions, record],
+    });
+  }
+
+  async appendEvent(
+    snapshot,
+    { key, step, kind, reason = null, session_id = null, observed_at },
+  ) {
+    validateSnapshot(snapshot);
+    const validatedKey = validateDecisionKey(key);
+    nonNegativeInteger(step, "event.step");
+    enumValue(kind, EVENT_KINDS, "event.kind");
+    const normalizedReason =
+      reason === null
+        ? null
+        : normalizeFailureReason(reason.code, reason.diagnostic ?? "");
+    if (EVENTS_WITHOUT_REASON.has(kind) !== (normalizedReason === null)) {
+      fail(
+        "event.reason",
+        EVENTS_WITHOUT_REASON.has(kind)
+          ? "must be null for launch and completion"
+          : "must classify this routing event",
+      );
+    }
+    if (session_id !== null) {
+      boundedLabel(session_id, "event.session_id", SOURCE_LABEL_LIMIT);
+    }
+    const observedAt = timestamp(observed_at, "event.observed_at");
+    const index = findRecordIndex(snapshot.decisions, validatedKey, step);
+    if (index === -1) {
+      throw new RoutingLedgerError(
+        `Unknown decision ${decisionKeyString(validatedKey)} step ${step}`,
+      );
+    }
+    const current = snapshot.decisions[index];
+    if (observedAt < current.observed_at) {
+      throw new RoutingLedgerError("Routing event observed_at cannot move backward");
+    }
+    let status = current.status;
+    if (kind === "launch") {
+      if (!new Set(["selected", "dispatched"]).has(current.status)) {
+        throw new RoutingLedgerError(`Cannot launch a ${current.status} routing step`);
+      }
+      status = "dispatched";
+    } else if (kind === "failure") {
+      if (current.status !== "dispatched") {
+        throw new RoutingLedgerError(`Cannot fail a ${current.status} routing step`);
+      }
+      status = "failed";
+    } else if (kind === "completion") {
+      if (current.status !== "dispatched") {
+        throw new RoutingLedgerError(`Cannot complete a ${current.status} routing step`);
+      }
+      status = "completed";
+    } else if (kind === "capacity_pause") {
+      if (current.status !== "dispatched") {
+        throw new RoutingLedgerError(`Cannot pause a ${current.status} routing step`);
+      }
+    } else if (!new Set(["failed", "superseded"]).has(current.status)) {
+      throw new RoutingLedgerError(
+        `Cannot append ${kind} to a ${current.status} routing step`,
+      );
+    }
+    const event = {
+      sequence: current.events.length,
+      kind,
+      reason: normalizedReason,
+      session_id,
+      observed_at: observedAt,
+    };
+    const decisions = snapshot.decisions.map((record, position) =>
+      position === index
+        ? {
+            ...record,
+            status,
+            events: [...record.events, event],
+            observed_at: observedAt,
+          }
+        : record,
+    );
+    const updatedAt =
+      snapshot.updated_at === null || observedAt > snapshot.updated_at
+        ? observedAt
+        : snapshot.updated_at;
+    return this.#commit(snapshot, {
+      schema: ROUTING_DECISIONS_SCHEMA,
+      updated_at: updatedAt,
+      decisions,
     });
   }
 

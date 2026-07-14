@@ -192,13 +192,18 @@ export function parseCodexStream(text) {
 }
 
 function resultEnvelope(taskId, role, payload) {
-  return Object.keys(payload).length === 1 && "failure_reason" in payload
+  return "failure_reason" in payload
     ? {
         schema: "aios.result/v1",
         task: taskId,
         role,
         status: "failure",
-        payload: { reason: payload.failure_reason },
+        payload: {
+          reason: payload.failure_reason,
+          ...(payload.failure_kind === undefined
+            ? {}
+            : { failure_kind: payload.failure_kind }),
+        },
       }
     : { schema: "aios.result/v1", task: taskId, role, status: "success", payload };
 }

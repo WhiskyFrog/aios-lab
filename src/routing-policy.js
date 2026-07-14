@@ -48,6 +48,19 @@ const ESCALATION_REASON_CODES = new Set([
   "review_rejected",
   "duplicate_evidence",
   "context_failure",
+  "verification_failed",
+  "context_insufficient",
+  "repeated_evidence",
+]);
+const RECOVERY_FALLBACK_CODES = new Set([
+  "capacity",
+  "timeout",
+  "provider_failure",
+]);
+const RECOVERY_ESCALATION_CODES = new Set([
+  "verification_failed",
+  "context_insufficient",
+  "repeated_evidence",
 ]);
 const HISTORY_REASON_CODES = new Set([
   "capacity",
@@ -59,6 +72,13 @@ const HISTORY_REASON_CODES = new Set([
   "context_failure",
   "operator_override",
   "no_eligible_candidate",
+  "provider_failure",
+  "verification_failed",
+  "context_insufficient",
+  "repeated_evidence",
+  "worker_reported_failure",
+  "invalid_result",
+  "routing_exhausted",
 ]);
 
 // Hard-gate reason codes in the fixed order they are evaluated. Cost and
@@ -74,6 +94,8 @@ export const SELECTION_REASON_CODES = Object.freeze([
   "latency_budget_exceeded",
   "tier_below_minimum",
   "tier_below_reviewer_floor",
+  "tier_below_recovery_floor",
+  "recovery_not_same_tier_cross_provider",
 ]);
 
 export class RoutingPolicyError extends TypeError {
@@ -754,6 +776,7 @@ export function selectCandidate({
   key,
   history = [],
   implementerDecision = null,
+  recovery = null,
 }) {
   const normalizedConfig = validateRoutingConfig(config);
   const validatedKey = validateDecisionKey(key);
@@ -786,6 +809,28 @@ export function selectCandidate({
     );
   }
   const priorCandidates = new Set(priorSteps.map((entry) => entry.chosen.candidate));
+  let normalizedRecovery = null;
+  if (recovery !== null) {
+    exactKeys(recovery, ["reason_code", "previous_candidate"], "recovery");
+    if (
+      !RECOVERY_FALLBACK_CODES.has(recovery.reason_code) &&
+      !RECOVERY_ESCALATION_CODES.has(recovery.reason_code)
+    ) {
+      fail("recovery.reason_code", `has an unknown value: ${String(recovery.reason_code)}`);
+    }
+    identifier(recovery.previous_candidate, "recovery.previous_candidate");
+    if (step === 0) {
+      fail("recovery", "cannot be supplied for the initial selection step");
+    }
+    const previous = priorSteps.find((entry) => entry.step === step - 1);
+    if (previous?.chosen.candidate !== recovery.previous_candidate) {
+      fail("recovery.previous_candidate", "must match the immediately preceding step");
+    }
+    normalizedRecovery = {
+      reason_code: recovery.reason_code,
+      previous_candidate: recovery.previous_candidate,
+    };
+  }
   const escalationsUsed = priorDecisions.filter(
     (entry) =>
       entry.key.task === validatedKey.task &&
@@ -795,6 +840,15 @@ export function selectCandidate({
     fail(
       "history",
       `exceeds escalation limit ${limits.escalations_per_task} for ${validatedKey.task}`,
+    );
+  }
+  if (
+    normalizedRecovery !== null &&
+    RECOVERY_ESCALATION_CODES.has(normalizedRecovery.reason_code) &&
+    escalationsUsed >= limits.escalations_per_task
+  ) {
+    throw new RoutingPolicyError(
+      `history: escalation limit ${limits.escalations_per_task} is exhausted for ${validatedKey.task}`,
     );
   }
 
@@ -827,7 +881,27 @@ export function selectCandidate({
         ? highRank
         : tierRanks.get(decision.tier)
       : null;
-  const requiredFloorRank = Math.max(baseMinRank, reviewerFloorRank ?? 0);
+  let recoveryFloorRank = 0;
+  const previousCandidate =
+    normalizedRecovery === null
+      ? null
+      : normalizedConfig.candidates.find(
+          (candidate) => candidate.id === normalizedRecovery.previous_candidate,
+        );
+  if (
+    normalizedRecovery !== null &&
+    RECOVERY_ESCALATION_CODES.has(normalizedRecovery.reason_code)
+  ) {
+    const previousRank = tierRanks.get(previousCandidate.tier);
+    recoveryFloorRank =
+      normalizedConfig.tiers.find(({ rank }) => rank > previousRank)?.rank ??
+      normalizedConfig.tiers[normalizedConfig.tiers.length - 1].rank + 1;
+  }
+  let requiredFloorRank = Math.max(
+    baseMinRank,
+    reviewerFloorRank ?? 0,
+    recoveryFloorRank,
+  );
 
   const budgetCostRank = costRanks.get(workload.budgets.cost);
   const budgetLatencyRank = latencyRanks.get(workload.budgets.latency);
@@ -868,6 +942,9 @@ export function selectCandidate({
       if (reviewerFloorRank !== null && rank < reviewerFloorRank) {
         reasons.push("tier_below_reviewer_floor");
       }
+      if (recoveryFloorRank > 0 && rank < recoveryFloorRank) {
+        reasons.push("tier_below_recovery_floor");
+      }
       return {
         candidate: candidate.id,
         provider: candidate.provider,
@@ -881,11 +958,49 @@ export function selectCandidate({
   const candidateById = new Map(
     normalizedConfig.candidates.map((candidate) => [candidate.id, candidate]),
   );
-  const eligible = considered.filter((entry) => entry.eligible);
+  let routedConsidered = considered;
+  if (
+    normalizedRecovery !== null &&
+    RECOVERY_FALLBACK_CODES.has(normalizedRecovery.reason_code)
+  ) {
+    const previousRank = tierRanks.get(previousCandidate.tier);
+    const sameTierCrossProvider = considered.some(
+      (entry) =>
+        entry.eligible &&
+        tierRanks.get(entry.tier) === previousRank &&
+        entry.provider !== previousCandidate.provider,
+    );
+    routedConsidered = considered.map((entry) => {
+      if (!entry.eligible) {
+        return entry;
+      }
+      const rank = tierRanks.get(entry.tier);
+      const allowed = sameTierCrossProvider
+        ? rank === previousRank && entry.provider !== previousCandidate.provider
+        : rank > previousRank;
+      if (allowed) {
+        return entry;
+      }
+      const reason = sameTierCrossProvider
+        ? "recovery_not_same_tier_cross_provider"
+        : "tier_below_recovery_floor";
+      return { ...entry, eligible: false, reasons: [...entry.reasons, reason] };
+    });
+  }
+  const eligible = routedConsidered.filter((entry) => entry.eligible);
   if (eligible.length === 0) {
     throw new NoEligibleCandidateError(
       `No eligible routing candidate for ${keyString}`,
-      deepFreeze(considered),
+      deepFreeze(routedConsidered),
+    );
+  }
+  if (
+    normalizedRecovery !== null &&
+    RECOVERY_FALLBACK_CODES.has(normalizedRecovery.reason_code)
+  ) {
+    requiredFloorRank = Math.max(
+      requiredFloorRank,
+      Math.min(...eligible.map((entry) => tierRanks.get(entry.tier))),
     );
   }
 
@@ -989,7 +1104,7 @@ export function selectCandidate({
       ([, rank]) => rank === requiredFloorRank,
     )[0],
     workload: workloadSummary(workload),
-    considered,
+    considered: routedConsidered,
     chosen: {
       candidate: chosenEntry.candidate,
       provider: chosenEntry.provider,
@@ -1024,7 +1139,7 @@ export function selectCandidate({
               candidate: decision.candidate,
               provider: decision.provider,
             },
-            cross_provider_disqualified: considered
+            cross_provider_disqualified: routedConsidered
               .filter((entry) => entry.provider !== decision.provider)
               .map((entry) => ({ candidate: entry.candidate, reasons: entry.reasons })),
           }

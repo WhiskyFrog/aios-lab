@@ -264,15 +264,14 @@ directory. Exit codes are 0 for checked/adopted, 1 for plan validation or
 adoption failure, and 64 for command usage errors. Running the adopted Tasks is
 deliberately separate; orchestration remains out of scope.
 
-## Adaptive Routing Contracts (Foundation)
+## Adaptive Routing and Bounded Dispatch
 
-`src/routing.js` defines the configuration and workload-evidence foundation for
-adaptive routing. `src/routing-policy.js` and `src/routing-ledger.js` add the
-pure selection policy and its durable decision record. They do not yet launch a
-model: the current `FileAssignmentResolver` remains the execution path for
-`aios.assignments/v1`, with the same re-read, session-ledger, and Role behavior
-described above. `parseExecutionConfig` activates routing contracts only when
-the input schema is explicitly `aios.routing/v1`.
+`src/routing.js` defines configuration and workload evidence,
+`src/routing-policy.js` performs pure selection, `src/routing-ledger.js` stores
+durable decisions and audit events, and `src/routing-dispatch.js` connects the
+selected candidate to the existing `CommandWorker`. `aios.assignments/v1`
+keeps its legacy Role-only behavior. Adaptive execution activates only when the
+input schema is explicitly `aios.routing/v1`.
 
 An `aios.routing/v1` document declares all model information as operator data:
 
@@ -377,6 +376,34 @@ used, the selector checks the current catalog relationship, Role eligibility,
 one policy revision per action, unique candidates and steps, and contiguous
 step order across every history key.
 
+### Sequential recovery in the Role loop
+
+For every Implementer or Reviewer action, the file resolver re-reads the routing
+configuration, hashes the validated policy into the exact decision key, builds
+the current workload, and persists the selected candidate before launch. The
+candidate's declared argv still runs through `CommandWorker`, so Task stdin,
+Result validation, session telemetry, timeouts, cancellation, Review projection,
+retry limits, and Approval behavior retain their existing authority. The human
+Approver is deliberately outside model routing and uses
+`workers/human-approver.mjs`.
+
+Recovery is sequential. Capacity, timeout, and typed provider failures first
+try one unused candidate at the same tier from another provider; only then may
+selection move upward. `verification_failed`, `context_insufficient`, and exact
+duplicate-Attempt evidence require a strictly higher tier. A failure Result
+without `failure_kind` remains an ordinary Worker failure and is never guessed
+into a route. Candidate ids cannot repeat within an action, so a route cannot
+cycle. Provider continuations stay with the capacity-deferred candidate; a
+fallback always starts with a null continuation.
+
+Every policy must declare positive finite `fallbacks_per_action` and
+`escalations_per_task` bounds. Repository tests use small limits of three
+fallbacks and two escalations; operators should keep production values similarly
+small because each edge can start another paid foreground session. The decision
+ledger records launch, capacity pause, classified failure, fallback/escalation
+edge, completion, and exhaustion events. Session ids are linked when available,
+while usage and cost remain solely in the session ledger.
+
 `RoutingDecisionLedger` persists strict `aios.routing-decisions/v1` JSON at
 `.aios/runtime/routing-decisions.json` with atomic replace and snapshot
 compare-and-swap checks. A decision is recorded before dispatch by its exact
@@ -391,11 +418,11 @@ forward, and ledger `updated_at` must equal the latest decision observation.
 
 Ledger rows contain only normalized workload evidence, ordered candidate gate
 results, the choice and fitness tuple, exact distribution evidence, optional
-normalized failure/override data, state, relationships, and caller-supplied
-timestamps. They exclude command argv, environment, Task/prompt bodies,
-credentials, continuation values, and raw provider errors. Diagnostics have a
-small reason-code vocabulary, are length-bounded, and redact common secrets and
-local user paths. Read APIs resolve an exact key, find the latest Task/Role
+normalized failure/override data, state, event/session relationships, and
+caller-supplied timestamps. They exclude command argv, environment, Task/prompt
+bodies, credentials, continuation values, and raw provider errors. Diagnostics
+have a small reason-code vocabulary, are length-bounded, and redact common
+secrets and local user paths. Read APIs resolve an exact key, find the latest Task/Role
 decision, count a bounded provider window, and produce a sanitized dashboard
 projection. Missing state is empty; malformed or conflicting state is never
 overwritten automatically.
@@ -451,8 +478,10 @@ session. It follows the command Worker contract: Task document on stdin,
 `AIOS_ROLE`/`AIOS_TASK_ID` in the environment, and one structured execution
 envelope on stdout. It consumes Claude Code NDJSON events. The session's
 JSON-only reply becomes the Result payload; a reply of
-`{"failure_reason": "..."}` becomes a `status: failure` Result, and anything
-structured but unusable becomes a telemetry-bearing failure Result. Malformed
+`{"failure_reason": "..."}` becomes a `status: failure` Result. A Worker may
+also add `"failure_kind":"verification_failed"` or
+`"failure_kind":"context_insufficient"` to request bounded routed escalation;
+anything structured but unusable becomes a telemetry-bearing failure Result. Malformed
 transport output exits nonzero. Both paths halt without a Task transition.
 
 ```json
@@ -531,8 +560,9 @@ resumed `thread.started.thread_id` to equal that exact id.
 The reply is read deterministically from a temporary
 `--output-last-message` file, which is removed after each session regardless
 of outcome. A valid role payload becomes a `status: success` Result, a
-`{"failure_reason": "..."}` reply becomes a `status: failure` Result, and a
-parseable Codex session failure becomes an ordinary failure Result so its
+`{"failure_reason": "..."}` reply becomes a `status: failure` Result. It may
+include the same closed `failure_kind` values described for Claude when routed;
+a parseable Codex session failure becomes an ordinary failure Result so its
 thread and usage telemetry are still recorded. Malformed JSONL or a stream
 without a thread id makes the adapter exit nonzero with no stdout.
 

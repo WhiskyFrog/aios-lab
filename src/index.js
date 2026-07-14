@@ -12,7 +12,9 @@ export {
   CapacityDeferredError,
   CommandWorker,
   FileAssignmentResolver,
+  ProviderFailureError,
   StaticAssignmentResolver,
+  WorkerTimeoutError,
 } from "./workers.js";
 export { SessionLedger } from "./sessions.js";
 export {
@@ -36,6 +38,7 @@ export {
   decisionRecordFromSelection,
   FAILURE_REASON_CODES,
   normalizeFailureReason,
+  ROUTING_EVENT_KINDS,
   ROUTING_DECISIONS_SCHEMA,
   RoutingDecisionLedger,
   routingDecisionsPath,
@@ -43,3 +46,8 @@ export {
   RoutingLedgerError,
   validateDecisionRecord,
 } from "./routing-ledger.js";
+export {
+  RoutedAssignmentResolver,
+  RoutingExhaustedError,
+  routingPolicyRevision,
+} from "./routing-dispatch.js";
