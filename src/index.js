@@ -18,6 +18,12 @@ export {
 } from "./workers.js";
 export { SessionLedger } from "./sessions.js";
 export {
+  AIOS_GITIGNORE,
+  AIOS_SCAFFOLD_DIRECTORIES,
+  initializeRepository,
+  validateAdapterPaths,
+} from "./init.js";
+export {
   inspectTarget,
   MAX_DERIVED_PLAN_ID_LENGTH,
   MAX_OBJECTIVE_BYTES,
