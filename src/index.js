@@ -18,6 +18,12 @@ export {
 } from "./workers.js";
 export { SessionLedger } from "./sessions.js";
 export {
+  createBrief,
+  createPlanningTaskFile,
+  MAX_BRIEF_TITLE_LENGTH,
+  renderPlanningTask,
+} from "./brief.js";
+export {
   AIOS_GITIGNORE,
   AIOS_SCAFFOLD_DIRECTORIES,
   initializeRepository,

@@ -311,10 +311,14 @@ export function validateObjective(objective) {
   return objective;
 }
 
-export function resolvePlanId({ objective, planId = undefined }) {
+export function resolvePlanId({
+  objective,
+  planId = undefined,
+  flagName = "--plan-id",
+}) {
   if (planId !== undefined) {
     if (typeof planId !== "string" || !PLAN_ID_PATTERN.test(planId)) {
-      throw operatorError(`--plan-id has an invalid value: ${String(planId)}`);
+      throw operatorError(`${flagName} has an invalid value: ${String(planId)}`);
     }
     return planId;
   }
@@ -326,7 +330,7 @@ export function resolvePlanId({ objective, planId = undefined }) {
     .slice(0, MAX_DERIVED_PLAN_ID_LENGTH)
     .replace(/-+$/g, "");
   if (slug.length === 0) {
-    throw operatorError("Objective cannot produce a plan id; supply --plan-id");
+    throw operatorError(`Objective cannot produce a plan id; supply ${flagName}`);
   }
   return slug;
 }

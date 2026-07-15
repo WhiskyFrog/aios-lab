@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { writeDashboard } from "./dashboard.js";
+import { createBrief } from "./brief.js";
 import { LoopEngine } from "./engine.js";
 import { initializeRepository } from "./init.js";
 import {
@@ -44,6 +45,7 @@ function usage() {
     "  aios dashboard [--root <path>] [--out <file>]",
     "  aios adopt <plan-dir> [--root <path>] [--check]",
     "  aios init [--root <path>] [--from <config-file>] [--check]",
+    "  aios brief <objective> [--root <path>] [--plan <plan-id>] [--project <project-id>] [--check]",
     "",
     "The repeatable --route-override flag displaces the adaptive routing policy",
     "choice for one command. <task-selector> is an exact task-#### id or * for",
@@ -77,12 +79,17 @@ function usage() {
     "AIOS scaffold. --from installs a validated local assignment/routing",
     "configuration; --check reports the complete action plan without writes.",
     "",
+    "The brief command creates one approval-required planning Task from an",
+    "operator objective. It never dispatches a Worker; --check resolves the",
+    "Task, plan, and project ids without writing.",
+    "",
     "Exit codes: run: 0 done, 1 halted, 2 blocked, 64 usage error, 75 waiting.",
     "            progress: 0 plan complete, 3 awaiting approval, 4 blocked,",
     "                      5 capacity wait, 6 cancelled, 7 halted, 64 usage error.",
     "            dashboard: 0 written, 64 usage error.",
     "            adopt: 0 checked/adopted, 1 validation failure, 64 usage error.",
     "            init: 0 initialized/checked, 1 target failure, 64 input error.",
+    "            brief: 0 created/checked, 1 target failure, 64 input error.",
   ].join("\n");
 }
 
@@ -273,6 +280,43 @@ function parseInitArguments(rest) {
   return options;
 }
 
+function parseBriefArguments(rest) {
+  if (rest.length < 1 || rest[0].startsWith("--")) {
+    throw new Error(usage());
+  }
+  const options = {
+    help: false,
+    command: "brief",
+    objective: rest[0],
+    root: process.cwd(),
+    planId: undefined,
+    project: undefined,
+    checkOnly: false,
+  };
+  for (let index = 1; index < rest.length; index += 1) {
+    const flag = rest[index];
+    if (flag === "--check") {
+      options.checkOnly = true;
+      continue;
+    }
+    const value = rest[index + 1];
+    if (!value) {
+      throw new Error(`Missing value for ${flag}`);
+    }
+    if (flag === "--root") {
+      options.root = path.resolve(value);
+    } else if (flag === "--plan") {
+      options.planId = value;
+    } else if (flag === "--project") {
+      options.project = value;
+    } else {
+      throw new Error(`Unknown option ${flag}`);
+    }
+    index += 1;
+  }
+  return options;
+}
+
 function parseArguments(argv) {
   if (argv.length === 0 || argv.includes("--help") || argv.includes("-h")) {
     return { help: true };
@@ -292,6 +336,9 @@ function parseArguments(argv) {
   }
   if (command === "init") {
     return parseInitArguments(rest);
+  }
+  if (command === "brief") {
+    return parseBriefArguments(rest);
   }
   throw new Error(usage());
 }
@@ -338,6 +385,25 @@ export async function main(argv = process.argv.slice(2)) {
       console.log(JSON.stringify(await initializeRepository({
         root: options.root,
         from: options.from,
+        checkOnly: options.checkOnly,
+      })));
+      return 0;
+    } catch (error) {
+      if (error instanceof TargetContractError) {
+        console.error(error.message);
+        return error.exitCode;
+      }
+      throw error;
+    }
+  }
+
+  if (options.command === "brief") {
+    try {
+      console.log(JSON.stringify(await createBrief({
+        root: options.root,
+        objective: options.objective,
+        planId: options.planId,
+        project: options.project,
         checkOnly: options.checkOnly,
       })));
       return 0;
