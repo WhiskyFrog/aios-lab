@@ -173,6 +173,88 @@ uses landmark regions, a correct heading hierarchy, and CSS-only responsive
 collapsing to a single column at narrow widths. The HTML uses inline CSS
 only and needs no JavaScript for its core view.
 
+## Operate Other Repositories from One AIOS Checkout
+
+AIOS itself stays in one source checkout on the operator's computer. It is not
+copied into every product repository. The target keeps only its own durable
+workflow evidence (`.aios/tasks/`, Reviews, approvals, and plans) plus ignored
+machine-local execution state. Run the central CLI with `--root` to select the
+repository it should operate on.
+
+From the AIOS checkout, bootstrap a target Git working tree:
+
+```console
+npm run aios -- init --root ../product-repo --from ../local-config/assignments.json
+```
+
+`init` accepts a direct `.git` directory or worktree `.git` file, validates the
+entire target and the supplied `aios.assignments/v1` or `aios.routing/v1`
+configuration before its first write, and idempotently ensures
+`.aios/tasks/`, `reviews/`, `results/`, `approvals/`, and `runtime/`. It also
+creates `.aios/.gitignore` for `runtime/` and `assignments.json`; provider
+commands, model catalogs, local adapter paths, sessions, and capacity state
+therefore remain machine-local rather than committed project policy.
+
+Every command token containing a path separator must be explicit: an absolute
+path must exist, while a relative adapter path must stay inside the target and
+name an existing file. AIOS never guesses an adapter location, model name, or
+credential. A valid existing configuration and `.gitignore` are preserved,
+even when a different `--from` source is supplied. Omitting `--from` prepares
+the repository without installing execution configuration. `--check` performs
+the same validation and reports `would_create`/`already_present` actions without
+writing. Exit codes are 0 for initialized/already initialized/checked, 1 for a
+target-state conflict, and 64 for malformed operator input.
+
+Create one planning Task from a natural-language goal:
+
+```console
+npm run aios -- brief "Add searchable release history" --root ../product-repo
+```
+
+The JSON response names the allocated Task, derived plan id, and project id.
+`--plan <id>` and `--project <id>` make either identity explicit; `--check`
+resolves the same values without writing. `brief` rejects an uninitialized
+target, unsafe Markdown structure, oversized/empty objectives, identity
+conflicts, existing plan directories, and Task collisions before creating
+anything. On success it writes exactly one approval-required planning Task and
+does not launch a Worker. The original Brief is embedded byte-for-byte and the
+generated Task limits its Implementer to the selected `plans/<plan-id>/`.
+
+Continue with the unchanged foreground commands, always pointing at the same
+target:
+
+```console
+npm run aios -- run task-0001 --root ../product-repo
+# Inspect the reviewed plan, then write approved or rejected to the reported
+# ../product-repo/.aios/approvals/task-0001 path and rerun the same command.
+npm run aios -- run task-0001 --root ../product-repo
+npm run aios -- adopt plans/add-searchable-release-history --root ../product-repo
+npm run aios -- progress plans/add-searchable-release-history --root ../product-repo
+npm run aios -- dashboard --root ../product-repo
+```
+
+The authority boundary does not change across repositories: Workers may
+propose files only in their granted workspace (the generated Planner Task grants
+`plans/<plan-id>/`), the engine owns lifecycle writes under `.aios/`, a human
+owns approval decision files, and only an explicit operator `adopt` command
+turns proposals into real Tasks. None of `init`, `brief`, `adopt`, or
+`dashboard` starts a background service. A hand-prepared repository that never
+ran `init` remains compatible with `run` and `dashboard` as long as its existing
+documents and local Assignment configuration are valid.
+
+The committed disposable proof is runnable without provider capacity or
+network access:
+
+```console
+node fixtures/cross-repo-demo.js
+```
+
+It creates a scratch repository with a different project identity, runs
+`init -> brief -> planning Review/Approval -> adopt -> progress -> dashboard`
+through the public CLI and deterministic fake Workers, verifies every artifact
+is in the scratch repository and the AIOS checkout is byte-for-byte unchanged,
+then removes the scratch directory.
+
 ## Planner
 
 Planner is an upstream convention, not a fourth engine Role and not a
