@@ -790,7 +790,10 @@ test("decision ledger records atomically, resolves exact keys, and projects sani
     counts: [{ provider: "claude", count: 1 }],
   });
   const projection = await ledger.dashboardProjection();
-  assert.equal(projection[0].chosen.model, "claude-configured-lower");
+  assert.equal(projection.decisions[0].chosen.model, "claude-configured-lower");
+  assert.equal(projection.decisions[0].advanced_by, null);
+  assert.equal(projection.summary.window, 20);
+  assert.equal(projection.summary.observed, 1);
   const raw = await readFile(file, "utf8");
   assert.doesNotMatch(raw, /command|environment|continuation|prompt/);
   assert.deepEqual(await ledger.record(recorded, record), recorded);

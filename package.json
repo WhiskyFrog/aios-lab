@@ -9,6 +9,7 @@
   },
   "scripts": {
     "aios": "node ./src/cli.js",
+    "demo:routing": "node ./fixtures/routing-demo.js",
     "test": "node --test"
   },
   "engines": {

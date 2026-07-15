@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { stringify } from "yaml";
 
@@ -14,6 +15,11 @@ import {
   validateRoutingConfig,
 } from "../src/routing.js";
 import { FileAssignmentResolver } from "../src/workers.js";
+
+const projectRoot = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+);
 
 function clone(value) {
   return structuredClone(value);
@@ -565,6 +571,21 @@ test("execution config preserves legacy assignments and activates routing only b
     () => parseExecutionConfig({ schema: "aios.unknown/v1" }),
     RoutingConfigError,
   );
+});
+
+test("routing uses the central human approver from a different target cwd", async (t) => {
+  const root = await temporaryRoot(t);
+  const configPath = path.join(root, "routing.json");
+  await writeFile(configPath, `${JSON.stringify(baseConfig(), null, 2)}\n`, "utf8");
+
+  const resolver = new FileAssignmentResolver(configPath, { cwd: root });
+  const approver = await resolver.resolve("approver");
+
+  assert.deepEqual(approver.command, [
+    process.execPath,
+    path.join(projectRoot, "workers", "human-approver.mjs"),
+  ]);
+  assert.equal(approver.cwd, path.resolve(root));
 });
 
 test("strict planning contract and explicit planning hints enforce the high tier", async (t) => {

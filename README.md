@@ -367,8 +367,9 @@ An `aios.routing/v1` document declares all model information as operator data:
 - optional provider-neutral `hints`, selected by exactly one Task or adopted
   plan, that declare work kind, complexity, risk, capabilities, verification,
   and budgets; and
-- optional candidate-id `overrides` selected by Task/wildcard and Role. Their
-  application is intentionally deferred to the later operator-control surface.
+- optional candidate-id `overrides` selected by Task/wildcard and Role, each
+  declaring `allow_fallback` explicitly. They are applied at selection time
+  with the precedence rules documented under "Operating adaptive routing".
 
 The parser is strict at every object level and reports the exact path of unknown
 fields. Model names and capabilities are never inferred from strings or fetched
@@ -522,6 +523,228 @@ finite distribution window from the actual preceding rows, and verifies that
 the greatest-deficit provider plus lowest candidate id produced the recorded
 winner. Self-consistent but fabricated counts therefore fail both load and
 record operations.
+
+### Operating adaptive routing
+
+AIOS has two execution modes, chosen only by the schema of the configuration
+file that `--assignments` points to (default `.aios/assignments.json`):
+
+- **Legacy Assignment mode** (`aios.assignments/v1`) maps each Role to one
+  command. It is the compatibility mode: it produces the same Worker, stdout,
+  exit codes, Task transitions, session records, and capacity behavior as
+  before routing existed, and it never writes a routing ledger.
+- **Adaptive routing mode** (`aios.routing/v1`) selects an Implementer or
+  Reviewer candidate per Task action. The human Approver always remains
+  outside model routing.
+
+Model availability, pricing, capability, and naming are operator-maintained
+configuration, not source-code truth: the engine never ships, infers, or
+fetches a model list, and nothing in this repository promises that any named
+commercial model is currently available. Replace the placeholder `model` ids
+and worker commands below with whatever your local Claude/Codex adapters
+accept today. Never put credentials, tokens, URLs, or user-local paths into
+`model` ids or anywhere else in the file; the validators reject
+credential-shaped values.
+
+```json
+{
+  "schema": "aios.routing/v1",
+  "tiers": [
+    { "id": "lower", "rank": 1 },
+    { "id": "high", "rank": 2 }
+  ],
+  "capabilities": ["filesystem"],
+  "cost_classes": ["economy", "standard"],
+  "latency_classes": ["standard"],
+  "candidates": [
+    {
+      "id": "claude-high",
+      "provider": "claude",
+      "model": "your-claude-high-model-id",
+      "tier": "high",
+      "roles": ["implementer", "reviewer"],
+      "command": ["node", "workers/claude-worker.mjs"],
+      "enabled": true,
+      "context_limit": 200000,
+      "capabilities": ["filesystem"],
+      "cost_class": "standard",
+      "latency_class": "standard"
+    },
+    {
+      "id": "codex-high",
+      "provider": "codex",
+      "model": "your-codex-high-model-id",
+      "tier": "high",
+      "roles": ["implementer", "reviewer"],
+      "command": ["node", "workers/codex-worker.mjs"],
+      "enabled": true,
+      "context_limit": 200000,
+      "capabilities": ["filesystem"],
+      "cost_class": "standard",
+      "latency_class": "standard"
+    },
+    {
+      "id": "claude-lower",
+      "provider": "claude",
+      "model": "your-claude-lower-model-id",
+      "tier": "lower",
+      "roles": ["implementer"],
+      "command": ["node", "workers/claude-worker.mjs", "--small"],
+      "enabled": true,
+      "context_limit": 64000,
+      "capabilities": ["filesystem"],
+      "cost_class": "economy",
+      "latency_class": "standard"
+    }
+  ],
+  "policy": {
+    "high_tier": "high",
+    "distribution_window": 20,
+    "provider_targets": [
+      { "provider": "claude", "weight": 1 },
+      { "provider": "codex", "weight": 1 }
+    ],
+    "limits": { "fallbacks_per_action": 2, "escalations_per_task": 2 },
+    "default_budgets": { "cost": "standard", "latency": "standard" }
+  },
+  "hints": [
+    {
+      "selector": { "task": "task-0012", "plan": null },
+      "work_kind": "implementation",
+      "complexity": "low",
+      "risk": "low",
+      "required_capabilities": ["filesystem"],
+      "verification": "objective",
+      "cost_budget": "economy",
+      "latency_budget": "standard"
+    }
+  ],
+  "overrides": [
+    {
+      "selector": { "task": "*", "role": "reviewer" },
+      "candidate": "codex-high",
+      "allow_fallback": true
+    }
+  ]
+}
+```
+
+The operating rules an operator relies on:
+
+- **Capability tiers and the Planner invariant.** `tiers` is a strict order.
+  A planning Task — recognized by an explicit `work_kind: planning` hint or
+  the strict plan-only Task contract — always requires `policy.high_tier`.
+  No cheaper candidate, provider deficit, or override can select a
+  lower-tier candidate for planning; the audit row records the lower
+  candidate's `tier_below_minimum` hard-gate rejection.
+- **Lower-tier eligibility.** A lower tier is possible only for a bounded
+  Implementer action whose evidence all passes: an explicit implementation
+  hint, low complexity, low risk, small/medium context, explicit
+  capabilities, objective verification, no approval requirement, and no
+  retry/failure history or safety-critical uncertainty. Anything unknown
+  stays at the high tier.
+- **Reviewer rules.** A Reviewer is never below the recorded Implementer
+  tier (and never below the high tier), and a different provider is
+  preferred. A same-provider Review is recorded as an explicit exception
+  with each cross-provider candidate's rejection reasons.
+- **Distribution is fitness-first.** Provider weights redistribute work only
+  among candidates whose entire fitness tuple is identical after every hard
+  gate; a deficit never restores a rejected candidate or beats a better
+  tuple. Ties resolve deterministically by provider then candidate id.
+- **Decision keys and audit.** Every action is keyed by
+  Task/Role/attempt/policy-revision and persisted before dispatch in
+  `.aios/runtime/routing-decisions.json`. Re-running the same action reuses
+  the recorded candidate; the choice does not drift as the window fills.
+
+### Routing overrides from the CLI
+
+`aios run` and `aios progress` accept a repeatable
+`--route-override <task-selector>:<role>=<candidate-id>` flag (quote the value
+so the shell does not expand `*` or split on `:`):
+
+```console
+npm run aios -- run task-0004 --route-override "task-0004:implementer=codex-high"
+```
+
+Precedence is: exact Task selector before `*`, and a CLI override before a
+configured override at equal specificity (the displaced configured candidate
+is preserved as audit evidence). An override displaces only cost/latency and
+distribution preference; every hard safety gate still applies, so an unsafe
+Planner or Reviewer downgrade fails closed before any Worker launch, naming
+each violated gate. A CLI override pins its candidate and denies fallback for
+the whole action; a configured override declares `allow_fallback` explicitly.
+Overrides are rejected with the legacy `aios.assignments/v1` schema.
+
+### Recovery order, limits, and continuation safety
+
+When a routed Worker fails, recovery is sequential and bounded by
+`policy.limits`:
+
+1. **Capacity, timeout, provider failure** first try one unused candidate at
+   the same tier from the other provider; promotion happens only when no
+   same-tier cross-provider candidate remains.
+2. **Typed `verification_failed`/`context_insufficient` failures and exact
+   duplicate-Attempt evidence** escalate directly to a strictly stronger
+   unused candidate.
+3. A rejected Review consumes the Task's normal retry; the next attempt's
+   selection observes that history (risk becomes high, so the choice rises),
+   and routing never resets or extends `retry.limit`.
+4. When the per-action fallback or per-Task escalation limit is exhausted —
+   or a fallback-denying override blocks recovery — the run ends in the
+   documented halted outcome with an `exhausted` audit event rather than
+   retrying any candidate.
+
+Capacity recovery is continuation-safe: a provider continuation token resumes
+only the exact candidate that issued it. When capacity defers and an
+equivalent cross-provider candidate exists, the fallback starts a fresh
+session with a null continuation; a foreign continuation is never sent across
+providers. When no fallback exists, the existing `--wait-for-capacity`,
+`--max-capacity-wait-ms`, and `--max-capacity-pauses` behavior applies
+unchanged to the same candidate.
+
+### Reading the routing dashboard
+
+`aios dashboard` renders the routing ledger read-only next to Task and session
+evidence. The routing section shows, per Task/Role action: the chosen
+candidate/provider/model/tier, the workload evidence and its sources, every
+considered candidate with its exact hard-gate rejections, the fitness tuple,
+the distribution window counts and exact rational deficits, override audit
+rows (source, selector, displaced policy winner, rationale), fallback and
+escalation edges with their reason codes, exhaustion, and the linked session
+ids. A summary compares configured provider target shares against the
+observed window. Routing rows are historical audit evidence — the Task's
+current state still comes from its Task document, and usage/cost stay in the
+session ledger.
+
+### Disabling routing
+
+Return to legacy Assignment mode by replacing the configuration content with
+an `aios.assignments/v1` document (or pointing `--assignments` at one). No
+other change is needed: dispatch goes back to the fixed per-Role commands and
+no new routing decisions are recorded. The existing
+`.aios/runtime/routing-decisions.json` remains as immutable history; like the
+session ledger it is operational evidence, not Task lifecycle truth, and may
+be deleted once it is no longer wanted.
+
+### End-to-end demonstration
+
+A disposable mixed-provider demonstration assembles the whole feature with
+fake Claude and Codex command Workers (`fixtures/routing-worker.js`) that
+declare explicit provider/model identities but never make a network or paid
+call:
+
+```console
+npm run demo:routing
+```
+
+It creates a temporary AIOS root with a routing configuration, a planning
+Task, an adoptable two-proposal plan, and general Tasks; runs the real
+`adopt`, `run`, `progress`, and `dashboard` CLI entry points as child
+processes; and prints a JSON report of high-tier planning, lower-tier
+implementation with cross-provider review, an audited CLI override, capacity
+fallback, audit/session correlation, and dashboard rendering. The temporary
+root is removed in `finally`, and the report contains no machine-local paths.
+The durable equivalents live in `test/routing-e2e.test.js`.
 
 ## Command Worker
 

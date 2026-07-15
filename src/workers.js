@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import { roleForState } from "./contracts.js";
 import {
@@ -10,6 +11,12 @@ import {
 } from "./sessions.js";
 
 const ROLES = new Set(["implementer", "reviewer", "approver"]);
+const HUMAN_APPROVER_WORKER = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "workers",
+  "human-approver.mjs",
+);
 
 export class AssignmentError extends Error {
   constructor(message, options = undefined) {
@@ -426,7 +433,7 @@ export class FileAssignmentResolver {
     }
     if (config?.schema === "aios.routing/v1") {
       if (role === "approver") {
-        return new CommandWorker([process.execPath, "workers/human-approver.mjs"], {
+        return new CommandWorker([process.execPath, HUMAN_APPROVER_WORKER], {
           cwd: this.cwd,
           timeoutMs: this.timeoutMs,
           ledger: this.ledger,

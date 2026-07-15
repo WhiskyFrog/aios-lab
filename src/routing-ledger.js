@@ -63,6 +63,13 @@ export const ROUTING_EVENT_KINDS = Object.freeze([
 ]);
 const FAILURE_CODES = new Set(FAILURE_REASON_CODES);
 const EVENT_KINDS = new Set(ROUTING_EVENT_KINDS);
+// Reason codes that advance a route by escalation rather than fallback,
+// mirroring the dispatch adapter's recovery classification.
+const ESCALATION_ADVANCE_CODES = new Set([
+  "verification_failed",
+  "context_insufficient",
+  "repeated_evidence",
+]);
 const EVENTS_WITHOUT_REASON = new Set(["launch", "completion"]);
 const GATE_CODES = new Set(SELECTION_REASON_CODES);
 const DIAGNOSTIC_LIMIT = 240;
@@ -1571,27 +1578,150 @@ export class RoutingDecisionLedger {
     });
   }
 
+  // The complete sanitized read model for the dashboard. Every field comes
+  // from validated ledger records (which never contain argv, executable
+  // paths, environment, credentials, prompt bodies, continuation tokens, or
+  // unsanitized provider stderr) plus display-only derivations: how a step
+  // was reached, whether its route exhausted, the sanitized session ids it
+  // touched, the compared Implementer decision for a Reviewer row, and
+  // window share arithmetic so rendering code never reproduces selection
+  // math.
   async dashboardProjection() {
     const state = await this.load();
-    return deepFreeze(
-      state.decisions.map((record) => ({
-        key_string: decisionKeyString(record.key),
-        task: record.key.task,
-        role: record.key.role,
-        attempt: record.key.attempt,
-        policy_revision: record.key.policy_revision,
-        step: record.step,
-        status: record.status,
-        chosen: { ...record.chosen },
-        reason_code: record.reason === null ? null : record.reason.code,
-        distribution: {
-          applied: record.distribution.applied,
-          changed_winner: record.distribution.changed_winner,
-        },
-        override_candidate: record.override === null ? null : record.override.candidate,
-        recorded_at: record.recorded_at,
-        observed_at: record.observed_at,
+    const decisions = state.decisions.map((record) => ({
+      key_string: decisionKeyString(record.key),
+      task: record.key.task,
+      role: record.key.role,
+      attempt: record.key.attempt,
+      policy_revision: record.key.policy_revision,
+      step: record.step,
+      parent_step: record.parent_step,
+      status: record.status,
+      reason:
+        record.reason === null
+          ? null
+          : { code: record.reason.code, diagnostic: record.reason.diagnostic },
+      advanced_by:
+        record.step === 0
+          ? null
+          : record.reason !== null && ESCALATION_ADVANCE_CODES.has(record.reason.code)
+          ? "escalation"
+          : "fallback",
+      exhausted: record.events.some((event) => event.kind === "exhausted"),
+      session_ids: [
+        ...new Set(
+          record.events
+            .map((event) => event.session_id)
+            .filter((sessionId) => sessionId !== null),
+        ),
+      ],
+      workload: structuredClone(record.workload),
+      considered: structuredClone(record.considered),
+      chosen: { ...record.chosen },
+      fitness: structuredClone(record.fitness),
+      distribution: structuredClone(record.distribution),
+      override: structuredClone(record.override),
+      same_provider_review: structuredClone(record.same_provider_review),
+      reviewer_comparison: reviewerComparison(state.decisions, record),
+      events: record.events.map((event) => ({
+        sequence: event.sequence,
+        kind: event.kind,
+        reason:
+          event.reason === null
+            ? null
+            : { code: event.reason.code, diagnostic: event.reason.diagnostic },
+        session_id: event.session_id,
+        observed_at: event.observed_at,
       })),
-    );
+      recorded_at: record.recorded_at,
+      observed_at: record.observed_at,
+    }));
+    return deepFreeze({
+      schema: ROUTING_DECISIONS_SCHEMA,
+      updated_at: state.updated_at,
+      decisions,
+      summary: projectionSummary(state.decisions),
+    });
   }
+}
+
+// The recorded Implementer decision a Reviewer row was compared against:
+// the latest Implementer step for the same Task attempt, exactly how the
+// dispatch adapter resolved it at selection time.
+function reviewerComparison(decisions, record) {
+  if (record.key.role !== "reviewer") {
+    return null;
+  }
+  for (let index = decisions.length - 1; index >= 0; index -= 1) {
+    const candidate = decisions[index];
+    if (
+      candidate.key.task === record.key.task &&
+      candidate.key.role === "implementer" &&
+      candidate.key.attempt === record.key.attempt
+    ) {
+      return {
+        candidate: candidate.chosen.candidate,
+        provider: candidate.chosen.provider,
+        model: candidate.chosen.model,
+        tier: candidate.chosen.tier,
+        provider_distinct: candidate.chosen.provider !== record.chosen.provider,
+      };
+    }
+  }
+  return null;
+}
+
+// Display arithmetic over the configured finite window that ends at the
+// latest decision: configured target shares, actual shares, and the signed
+// deficit (positive = under target) in decision counts. The exact rational
+// deficits each selection actually used remain on the per-decision
+// distribution evidence; these numbers exist only for the summary view.
+function projectionSummary(decisions) {
+  if (decisions.length === 0) {
+    return null;
+  }
+  const latest = decisions[decisions.length - 1];
+  const window = latest.distribution.window;
+  const rows = decisions.slice(-window);
+  const observed = rows.length;
+  const weights = new Map(
+    latest.distribution.counts.map(({ provider, weight }) => [provider, weight]),
+  );
+  const totalWeight = [...weights.values()].reduce((sum, weight) => sum + weight, 0);
+  const tally = (select) => {
+    const counts = new Map();
+    for (const row of rows) {
+      const value = select(row);
+      counts.set(value, (counts.get(value) ?? 0) + 1);
+    }
+    return counts;
+  };
+  const providerCounts = tally((row) => row.chosen.provider);
+  const providers = [...new Set([...weights.keys(), ...providerCounts.keys()])]
+    .sort(compareText)
+    .map((provider) => {
+      const weight = weights.get(provider) ?? null;
+      const count = providerCounts.get(provider) ?? 0;
+      const targetShare = weight === null || totalWeight === 0 ? null : weight / totalWeight;
+      return {
+        provider,
+        weight,
+        target_share: targetShare,
+        count,
+        actual_share: observed === 0 ? 0 : count / observed,
+        deficit: targetShare === null ? null : targetShare * observed - count,
+      };
+    });
+  const grouped = (counts, name) =>
+    [...counts.entries()]
+      .sort(([left], [right]) => compareText(left, right))
+      .map(([value, count]) => ({ [name]: value, count }));
+  return {
+    window,
+    observed,
+    providers,
+    models: grouped(tally((row) => row.chosen.model), "model"),
+    tiers: grouped(tally((row) => row.chosen.tier), "tier"),
+    roles: grouped(tally((row) => row.key.role), "role"),
+  };
 }
