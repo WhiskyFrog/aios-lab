@@ -18,8 +18,20 @@ import {
   normalizeRouteOverrides,
   validateRouteOverridesForConfig,
 } from "./routing.js";
+import {
+  candidateCooldownsPath,
+  CandidateCooldownStore,
+} from "./routing-cooldown-store.js";
+import {
+  RoutingDecisionLedger,
+  RoutingLedgerError,
+  routingDecisionsPath,
+} from "./routing-ledger.js";
 import { FileAssignmentResolver } from "./workers.js";
 import { TargetContractError } from "./targets.js";
+
+const CANDIDATE_ID = /^[a-z0-9][a-z0-9._-]*$/;
+const ROUTE_RESET_SELECTOR = /^(task-[0-9]{4,}):(implementer|reviewer):([1-9][0-9]*)$/;
 
 const PROGRESS_EXIT_CODES = Object.freeze({
   [STOP_REASONS.PLAN_COMPLETE]: 0,
@@ -46,6 +58,9 @@ function usage() {
     "  aios adopt <plan-dir> [--root <path>] [--check]",
     "  aios init [--root <path>] [--from <config-file>] [--check]",
     "  aios brief <objective> [--root <path>] [--plan <plan-id>] [--project <project-id>] [--check]",
+    "  aios route cooldowns [--root <path>]",
+    "  aios route clear-cooldown <candidate-id> [--root <path>]",
+    "  aios route reset <task-id>:<role>:<attempt> [--root <path>] [--reason <text>]",
     "",
     "The repeatable --route-override flag displaces the adaptive routing policy",
     "choice for one command. <task-selector> is an exact task-#### id or * for",
@@ -83,6 +98,25 @@ function usage() {
     "operator objective. It never dispatches a Worker; --check resolves the",
     "Task, plan, and project ids without writing.",
     "",
+    "The route cooldowns command lists every currently active (non-expired)",
+    "per-candidate capacity cooldown recorded at",
+    ".aios/runtime/candidate-cooldowns.json, sorted by candidate id, with its",
+    "retry_at and evidence. The route clear-cooldown command removes exactly",
+    "the named candidate's active cooldown so an operator can unblock it",
+    "before its retry_at when a provider quota resets ahead of schedule; it is",
+    "an idempotent no-op when the candidate has no cooldown. Neither command",
+    "requires or accepts provider credentials, argv, or model identifiers.",
+    "",
+    "The route reset command supersedes every recorded routing-decision row",
+    "for exactly one task:role:attempt action whose rows are all selected,",
+    "dispatched, or failed, so a fresh selection for that key can proceed",
+    "under the current routing-policy revision without hand-editing",
+    ".aios/runtime/routing-decisions.json. It refuses, with no write, when",
+    "any row for that key is already completed or superseded, or when the",
+    "key has no recorded rows at all. --reason records an operator-supplied",
+    "diagnostic alongside the fixed policy-changed audit code; every",
+    "existing row and field stays untouched history.",
+    "",
     "Exit codes: run: 0 done, 1 halted, 2 blocked, 64 usage error, 75 waiting.",
     "            progress: 0 plan complete, 3 awaiting approval, 4 blocked,",
     "                      5 capacity wait, 6 cancelled, 7 halted, 64 usage error.",
@@ -90,6 +124,7 @@ function usage() {
     "            adopt: 0 checked/adopted, 1 validation failure, 64 usage error.",
     "            init: 0 initialized/checked, 1 target failure, 64 input error.",
     "            brief: 0 created/checked, 1 target failure, 64 input error.",
+    "            route: 0 success, 64 usage error.",
   ].join("\n");
 }
 
@@ -317,6 +352,88 @@ function parseBriefArguments(rest) {
   return options;
 }
 
+function parseRouteRootOnlyArguments(rest, command) {
+  const options = { help: false, command, root: process.cwd() };
+  for (let index = 0; index < rest.length; index += 1) {
+    const flag = rest[index];
+    const value = rest[index + 1];
+    if (!value) {
+      throw new Error(`Missing value for ${flag}`);
+    }
+    if (flag === "--root") {
+      options.root = path.resolve(value);
+    } else {
+      throw new Error(`Unknown option ${flag}`);
+    }
+    index += 1;
+  }
+  return options;
+}
+
+function parseRouteClearCooldownArguments(rest) {
+  if (rest.length < 1 || rest[0].startsWith("--")) {
+    throw new Error(usage());
+  }
+  const options = parseRouteRootOnlyArguments(rest.slice(1), "route-clear-cooldown");
+  options.candidateId = rest[0];
+  if (!CANDIDATE_ID.test(options.candidateId)) {
+    throw new Error(`Invalid candidate id: ${options.candidateId}`);
+  }
+  return options;
+}
+
+function parseRouteResetArguments(rest) {
+  if (rest.length < 1 || rest[0].startsWith("--")) {
+    throw new Error(usage());
+  }
+  const [selector, ...flagRest] = rest;
+  const options = { help: false, command: "route-reset", root: process.cwd(), reason: null };
+  for (let index = 0; index < flagRest.length; index += 1) {
+    const flag = flagRest[index];
+    const value = flagRest[index + 1];
+    if (!value) {
+      throw new Error(`Missing value for ${flag}`);
+    }
+    if (flag === "--root") {
+      options.root = path.resolve(value);
+    } else if (flag === "--reason") {
+      options.reason = value;
+    } else {
+      throw new Error(`Unknown option ${flag}`);
+    }
+    index += 1;
+  }
+  const match = ROUTE_RESET_SELECTOR.exec(selector);
+  if (match === null) {
+    throw new Error(
+      `Invalid route reset selector ${JSON.stringify(selector)}: expected ` +
+        "<task-id>:<role>:<attempt> (role is implementer or reviewer, " +
+        "attempt is a positive integer)",
+    );
+  }
+  options.task = match[1];
+  options.role = match[2];
+  options.attempt = Number(match[3]);
+  return options;
+}
+
+function parseRouteArguments(rest) {
+  if (rest.length < 1) {
+    throw new Error(usage());
+  }
+  const [subcommand, ...subRest] = rest;
+  if (subcommand === "cooldowns") {
+    return parseRouteRootOnlyArguments(subRest, "route-cooldowns");
+  }
+  if (subcommand === "clear-cooldown") {
+    return parseRouteClearCooldownArguments(subRest);
+  }
+  if (subcommand === "reset") {
+    return parseRouteResetArguments(subRest);
+  }
+  throw new Error(usage());
+}
+
 function parseArguments(argv) {
   if (argv.length === 0 || argv.includes("--help") || argv.includes("-h")) {
     return { help: true };
@@ -339,6 +456,9 @@ function parseArguments(argv) {
   }
   if (command === "brief") {
     return parseBriefArguments(rest);
+  }
+  if (command === "route") {
+    return parseRouteArguments(rest);
   }
   throw new Error(usage());
 }
@@ -411,6 +531,59 @@ export async function main(argv = process.argv.slice(2)) {
       if (error instanceof TargetContractError) {
         console.error(error.message);
         return error.exitCode;
+      }
+      throw error;
+    }
+  }
+
+  if (options.command === "route-cooldowns") {
+    const store = new CandidateCooldownStore(candidateCooldownsPath(options.root));
+    const active = await store.activeCooldowns(new Date().toISOString());
+    console.log(
+      JSON.stringify(
+        active.map(({ candidate, retry_at, reason_code, evidence }) => ({
+          candidate,
+          retry_at,
+          reason_code,
+          evidence,
+        })),
+      ),
+    );
+    return 0;
+  }
+
+  if (options.command === "route-clear-cooldown") {
+    const store = new CandidateCooldownStore(candidateCooldownsPath(options.root));
+    const snapshot = await store.load();
+    await store.clearCooldown(snapshot, options.candidateId, new Date().toISOString());
+    console.log(JSON.stringify({ candidate: options.candidateId, cleared: true }));
+    return 0;
+  }
+
+  if (options.command === "route-reset") {
+    const ledger = new RoutingDecisionLedger(routingDecisionsPath(options.root));
+    try {
+      const snapshot = await ledger.load();
+      await ledger.resetAction(snapshot, {
+        task: options.task,
+        role: options.role,
+        attempt: options.attempt,
+        reason: options.reason,
+        observed_at: new Date().toISOString(),
+      });
+      console.log(
+        JSON.stringify({
+          task: options.task,
+          role: options.role,
+          attempt: options.attempt,
+          reset: true,
+        }),
+      );
+      return 0;
+    } catch (error) {
+      if (error instanceof RoutingLedgerError) {
+        console.error(error.message);
+        return 64;
       }
       throw error;
     }

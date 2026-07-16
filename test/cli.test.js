@@ -12,6 +12,8 @@ import { stringify } from "yaml";
 
 import { main } from "../src/cli.js";
 import { TaskStore } from "../src/documents.js";
+import { candidateCooldownsPath } from "../src/routing-cooldown-store.js";
+import { CANDIDATE_COOLDOWNS_SCHEMA } from "../src/routing-cooldowns.js";
 
 const executeFile = promisify(execFile);
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -986,4 +988,149 @@ test("an already-cancelled CLI progression stops at the Task boundary without di
   assert.equal(existsSync(marker), false);
   assert.equal(process.listenerCount("SIGTERM"), 0);
   assert.equal(process.listenerCount("SIGINT"), 0);
+});
+
+async function seedCooldownStore(root, cooldowns) {
+  const filePath = candidateCooldownsPath(root);
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(
+    filePath,
+    `${JSON.stringify(
+      { schema: CANDIDATE_COOLDOWNS_SCHEMA, updated_at: "2026-07-16T00:00:00.000Z", cooldowns },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+  return filePath;
+}
+
+test("--help documents the route cooldown commands", async () => {
+  const { stdout } = await executeFile(process.execPath, [cli, "--help"], {
+    windowsHide: true,
+  });
+  assert.match(stdout, /aios route cooldowns \[--root <path>\]/);
+  assert.match(stdout, /aios route clear-cooldown <candidate-id> \[--root <path>\]/);
+  assert.match(stdout, /route: 0 success, 64 usage error\./);
+});
+
+test("route usage and validation errors exit 64", async (t) => {
+  const root = await createProgressRoot(t);
+  const cases = [
+    [["route"], /Usage:/],
+    [["route", "bogus-subcommand"], /Usage:/],
+    [["route", "cooldowns", "--bogus", "x"], /Unknown option --bogus/],
+    [["route", "cooldowns", "--root"], /Missing value for --root/],
+    [["route", "clear-cooldown"], /Usage:/],
+    [["route", "clear-cooldown", "--root", root], /Usage:/],
+    [["route", "clear-cooldown", "Not-Lowercase"], /Invalid candidate id: Not-Lowercase/],
+  ];
+  for (const [argv, pattern] of cases) {
+    await assert.rejects(
+      executeFile(process.execPath, [cli, ...argv], { cwd: root, windowsHide: true }),
+      (error) => error.code === 64 && pattern.test(error.stderr),
+      `expected ${JSON.stringify(argv)} to exit 64 matching ${pattern}`,
+    );
+  }
+});
+
+test("aios route cooldowns lists exactly the active set, sorted by candidate id", async (t) => {
+  const root = await createProgressRoot(t);
+  const empty = await executeFile(
+    process.execPath,
+    [cli, "route", "cooldowns", "--root", root],
+    { cwd: root, windowsHide: true },
+  );
+  assert.equal(empty.stderr, "");
+  assert.deepEqual(JSON.parse(empty.stdout), []);
+
+  await seedCooldownStore(root, [
+    {
+      candidate: "claude-lower",
+      retry_at: new Date(Date.now() + 3_600_000).toISOString(),
+      reason_code: "capacity",
+      evidence: "claude cooldown",
+    },
+    {
+      candidate: "codex-high",
+      retry_at: new Date(Date.now() - 3_600_000).toISOString(),
+      reason_code: "capacity",
+      evidence: "expired cooldown",
+    },
+    {
+      candidate: "codex-lower",
+      retry_at: new Date(Date.now() + 3_600_000).toISOString(),
+      reason_code: "capacity",
+      evidence: "codex cooldown",
+    },
+  ]);
+
+  const populated = await executeFile(
+    process.execPath,
+    [cli, "route", "cooldowns", "--root", root],
+    { cwd: root, windowsHide: true },
+  );
+  assert.equal(populated.stderr, "");
+  assert.deepEqual(
+    JSON.parse(populated.stdout).map(({ candidate, evidence }) => [candidate, evidence]),
+    [
+      ["claude-lower", "claude cooldown"],
+      ["codex-lower", "codex cooldown"],
+    ],
+  );
+});
+
+test("aios route clear-cooldown removes exactly one entry and is a no-op when absent", async (t) => {
+  const root = await createProgressRoot(t);
+  const filePath = await seedCooldownStore(root, [
+    {
+      candidate: "claude-lower",
+      retry_at: new Date(Date.now() + 3_600_000).toISOString(),
+      reason_code: "capacity",
+      evidence: "claude cooldown",
+    },
+    {
+      candidate: "codex-lower",
+      retry_at: new Date(Date.now() + 3_600_000).toISOString(),
+      reason_code: "capacity",
+      evidence: "codex cooldown",
+    },
+  ]);
+
+  const cleared = await executeFile(
+    process.execPath,
+    [cli, "route", "clear-cooldown", "claude-lower", "--root", root],
+    { cwd: root, windowsHide: true },
+  );
+  assert.equal(cleared.stderr, "");
+  assert.deepEqual(JSON.parse(cleared.stdout), { candidate: "claude-lower", cleared: true });
+  const afterFirst = JSON.parse(await readFile(filePath, "utf8"));
+  assert.deepEqual(
+    afterFirst.cooldowns.map(({ candidate }) => candidate),
+    ["codex-lower"],
+  );
+
+  const noop = await executeFile(
+    process.execPath,
+    [cli, "route", "clear-cooldown", "claude-lower", "--root", root],
+    { cwd: root, windowsHide: true },
+  );
+  assert.equal(noop.stderr, "");
+  assert.deepEqual(JSON.parse(noop.stdout), { candidate: "claude-lower", cleared: true });
+  const afterSecond = JSON.parse(await readFile(filePath, "utf8"));
+  assert.deepEqual(
+    afterSecond.cooldowns.map(({ candidate }) => candidate),
+    ["codex-lower"],
+  );
+});
+
+test("aios route clear-cooldown on a missing store is a no-op that exits 0", async (t) => {
+  const root = await createProgressRoot(t);
+  const result = await executeFile(
+    process.execPath,
+    [cli, "route", "clear-cooldown", "claude-lower", "--root", root],
+    { cwd: root, windowsHide: true },
+  );
+  assert.equal(result.stderr, "");
+  assert.deepEqual(JSON.parse(result.stdout), { candidate: "claude-lower", cleared: true });
 });

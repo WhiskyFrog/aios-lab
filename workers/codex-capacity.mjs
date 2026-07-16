@@ -116,6 +116,109 @@ export function capacityFromAppServer(
   };
 }
 
+// Fixed grammar for the one Codex usage-limit message this fallback
+// recognizes (captured verbatim in fixtures/codex-usage-limit.ndjson and
+// confirmed against dogfooding finding 2 of
+// reports/dogfooding-whisky-frog-bundle1.md). Only this exact two-sentence
+// template, with a bare clock-time or bare month-day reset clause, is
+// corroborated; anything else fails closed.
+const USAGE_LIMIT_MESSAGE =
+  /^You've hit your usage limit\.\nTo get more access now, send a request to your admin or try again at (.+)\.$/;
+
+const CLOCK_CLAUSE = /^(1[0-2]|[1-9]):([0-5][0-9]) ?([AaPp][Mm])$/;
+const MONTH_DAY_CLAUSE =
+  /^(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?) ([0-9]{1,2})(?:st|nd|rd|th)?$/;
+const MONTH_INDEX_BY_ABBREVIATION = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+};
+const DAYS_IN_MONTH = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+function parseResetClause(clause) {
+  const clock = CLOCK_CLAUSE.exec(clause);
+  if (clock !== null) {
+    let hour = Number(clock[1]) % 12;
+    if (clock[3].toLowerCase() === "pm") {
+      hour += 12;
+    }
+    return { kind: "clock", hour, minute: Number(clock[2]) };
+  }
+  const monthDay = MONTH_DAY_CLAUSE.exec(clause);
+  if (monthDay !== null) {
+    const month = MONTH_INDEX_BY_ABBREVIATION[monthDay[1].slice(0, 3).toLowerCase()];
+    const day = Number(monthDay[2]);
+    if (month === undefined || day < 1 || day > DAYS_IN_MONTH[month]) {
+      return null;
+    }
+    return { kind: "monthday", month, day };
+  }
+  return null;
+}
+
+function nearestFutureClock(anchorMilliseconds, hour, minute) {
+  const anchor = new Date(anchorMilliseconds);
+  const candidate = new Date(
+    Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), anchor.getUTCDate(), hour, minute, 0, 0),
+  );
+  if (candidate.getTime() <= anchorMilliseconds) {
+    candidate.setUTCDate(candidate.getUTCDate() + 1);
+  }
+  return candidate;
+}
+
+function nearestFutureMonthDay(anchorMilliseconds, month, day) {
+  const anchor = new Date(anchorMilliseconds);
+  const candidate = new Date(Date.UTC(anchor.getUTCFullYear(), month, day, 0, 0, 0, 0));
+  if (candidate.getUTCMonth() !== month) {
+    return null;
+  }
+  if (candidate.getTime() <= anchorMilliseconds) {
+    candidate.setUTCFullYear(candidate.getUTCFullYear() + 1);
+    if (candidate.getUTCMonth() !== month) {
+      return null;
+    }
+  }
+  return candidate;
+}
+
+// Second-tier corroboration: parses only the reported text of the exact
+// session being evaluated against the fixed usage-limit grammar above. Reads
+// no other evidence and performs no I/O. Engages only where
+// capacityFromAppServer / queryCodexCapacity did not already corroborate the
+// same session; fails closed (returns null) on any text outside the fixed
+// grammar, including multiple candidate dates, a missing reset clause,
+// unrecognized wording, a non-Codex error shape, or a clause that resolves to
+// a non-future or ambiguous (e.g. Feb 29 in a non-leap year) time.
+export function capacityFromReportedText(text, observedAt) {
+  if (!nonEmptyString(text)) {
+    return null;
+  }
+  const anchorMilliseconds = Date.parse(observedAt);
+  if (!Number.isFinite(anchorMilliseconds)) {
+    return null;
+  }
+  const match = USAGE_LIMIT_MESSAGE.exec(text.trim());
+  if (match === null) {
+    return null;
+  }
+  const clause = parseResetClause(match[1]);
+  if (clause === null) {
+    return null;
+  }
+  const resetDate =
+    clause.kind === "clock"
+      ? nearestFutureClock(anchorMilliseconds, clause.hour, clause.minute)
+      : nearestFutureMonthDay(anchorMilliseconds, clause.month, clause.day);
+  if (resetDate === null || !(resetDate.getTime() > anchorMilliseconds)) {
+    return null;
+  }
+  const reset = resetDate.toISOString();
+  return {
+    retry_at: reset,
+    capacity: { status: "rejected", utilization: 1, resets_at: reset },
+  };
+}
+
 function appServerRequests(threadId) {
   return {
     initialize: {

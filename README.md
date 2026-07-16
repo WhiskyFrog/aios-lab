@@ -702,6 +702,94 @@ providers. When no fallback exists, the existing `--wait-for-capacity`,
 `--max-capacity-wait-ms`, and `--max-capacity-pauses` behavior applies
 unchanged to the same candidate.
 
+### Candidate cooldowns and operator recovery
+
+`CandidateCooldownStore` persists strict `aios.candidate-cooldowns/v1` JSON at
+`.aios/runtime/candidate-cooldowns.json`, using the same atomic-replace,
+exclusive-lock, and snapshot compare-and-swap discipline as
+`RoutingDecisionLedger`. A missing file is empty state; malformed content is a
+named error and is never silently discarded or repaired. Each record holds a
+catalog candidate id, the ISO `retry_at` it may be reselected, the failure
+reason code that justified it, and a bounded, sanitized evidence string
+redacted the same way routing-decision diagnostics are. This store is
+independent of the routing-decision ledger: clearing or expiring a cooldown
+never rewrites, deletes, or otherwise touches a decision row.
+
+The lifecycle is entirely driven by ordinary dispatch and operator commands —
+there is no daemon or background timer:
+
+- **Created on corroborated capacity.** When routed dispatch classifies a
+  Worker failure as `capacity` — from either the structured app-server probe
+  or the widened textual corroboration described above — it records or
+  refreshes the failing candidate's cooldown with the corroborated `retry_at`,
+  alongside (never instead of) the existing capacity-pause routing-decision
+  event.
+- **Read and pruned at every routed selection.** Before selecting a
+  candidate, dispatch loads the current cooldown state and prunes entries
+  whose `retry_at` is at or before the observation time; an expired cooldown
+  never blocks selection and is dropped from the persisted file the next time
+  a write touches that store. The remaining active records are passed into
+  `selectCandidate`'s `cooldowns` input, which gates a still-cooled candidate
+  with the non-overridable `candidate_cooldown_active` hard-gate reason (an
+  operator override cannot restore it, unlike a cost- or latency-rejected
+  candidate) — recorded on the considered-candidate audit row exactly like
+  every other gate rejection.
+- **Cleared by the operator.** `aios route cooldowns [--root <path>]` lists
+  every currently active (non-expired) cooldown — candidate id, `retry_at`,
+  and evidence — sorted by candidate id, and exits 0 with an empty list when
+  none are active. `aios route clear-cooldown <candidate-id> [--root <path>]`
+  removes exactly the named candidate's active cooldown, an idempotent no-op
+  when it has none, so an operator can unblock a candidate as soon as a
+  provider quota resets ahead of its recorded `retry_at` without hand-editing
+  any JSON. The removal is itself an atomic compare-and-swap write like every
+  other mutation of this state. Neither command requires or accepts provider
+  credentials, argv, or model identifiers, and both exit 64 on a usage error.
+
+### Resetting a policy-stranded action
+
+`RoutingDecisionLedger.record` and `resolveKey` require every recorded row of
+one action key (`task:role:attempt`) to share a single policy revision, and
+raise a policy-revision conflict as soon as a routing-config edit changes that
+revision while the action is still in flight. This is dogfooding finding 4:
+an ordinary routing-config change strands any non-terminal action, and the
+only recovery used to be hand-editing
+`.aios/runtime/routing-decisions.json` twice — once for the decision rows,
+once to manually restore the ledger's `updated_at` invariant.
+
+`aios route reset <task-id>:<role>:<attempt> [--root <path>] [--reason <text>]`
+is the operator-invoked remedy. It locates every recorded row for that exact
+`task:role:attempt` key and:
+
+- **Can reset** a key whose rows are all `selected`, `dispatched`, or
+  `failed` — the Brief's "all non-terminal or failed" scope. Every one of
+  those rows is superseded together, atomically, in one compare-and-swap
+  write: each gets a new terminal `reset` event recording the supplied
+  `--reason` text (or a default) alongside a fixed `policy_changed` audit
+  code, moves to status `superseded`, and its `observed_at` advances no
+  earlier than the row's own prior `observed_at`. No existing field is
+  rewritten in place — the rows stay on disk, unmodified history, forever.
+- **Cannot reset** a key with any row already `completed` (a finished action
+  is never silently redone) or already `superseded` (nothing to reset
+  twice), a key with no recorded rows at all, or a malformed
+  `<task-id>:<role>:<attempt>` selector — each rejected with a distinct,
+  actionable message and exit 64, writing nothing.
+
+Once every row of a key's decision sequence is superseded, `resolveKey`
+resolves it as if the action had never run, and `record` accepts a fresh step
+0 for the same `task:role:attempt` under the current policy revision — a new,
+unrelated decision sequence coexisting with the superseded rows, not a
+replacement of them. This is the intended remedy for a routing-policy
+revision change stranding an in-flight action, replacing the hand-editing
+workaround finding 4 recorded. It does not touch Task documents, Reviews,
+approvals, or the session ledger, and it never attaches, changes, or accepts
+a new override on the reset rows — an override stays exactly as immutable as
+finding 5 established; resetting the action, never mutating or reattaching
+an override to the old row, is the only way to change course on it. `aios
+route reset` is the plan's only command an operator runs by hand between loop
+runs rather than something the engine invokes automatically, and it never
+grows into a general ledger-editing or ledger-deletion tool — it stays
+narrowly scoped to superseding one stranded action key.
+
 ### Reading the routing dashboard
 
 `aios dashboard` renders the routing ledger read-only next to Task and session
@@ -881,19 +969,45 @@ fixture source is this [published raw Codex execution
 trace](https://gist.github.com/konard/4b15728ce4ff3cddb6ea482a43e32c4c),
 and the absence of capacity fields agrees with the [Codex exec event
 schema](https://github.com/openai/codex/blob/main/codex-rs/exec/src/exec_events.rs).
-On a failed turn, the adapter now starts the same Codex launcher's official
-app-server transport and asks for two independent structured records:
-`thread/resume` must report `codexErrorInfo: "usageLimitExceeded"` for the
-exact failed thread, and `account/rateLimits/read` must report a rejected,
-exhausted Codex rate window with a future Unix `resetsAt`. If multiple windows
-are exhausted, AIOS waits for the latest reset. Only that corroborated case
-becomes a capacity deferral using the exact thread id as its continuation.
+On a failed turn, the adapter corroborates capacity through two tiers, tried
+in order, in `workers/codex-capacity.mjs`:
 
-The adapter still never parses error prose, token counts, local rollout files,
-or hard-coded quota windows to invent `retry_at`. Missing app-server support,
-an unreadable thread, a stale or absent reset, credit-only exhaustion, and all
-non-usage errors remain ordinary failures for operator inspection. Claude's
-structured deferral behavior is unchanged.
+1. **Structured app-server probe (preferred).** The adapter starts the same
+   Codex launcher's official app-server transport and asks for two
+   independent structured records: `thread/resume` must report
+   `codexErrorInfo: "usageLimitExceeded"` for the exact failed thread, and
+   `account/rateLimits/read` must report a rejected, exhausted Codex rate
+   window with a future Unix `resetsAt`. If multiple windows are exhausted,
+   AIOS waits for the latest reset. This corroborated case becomes a capacity
+   deferral using the exact thread id as its continuation, exactly as before.
+2. **Textual fallback (only when the probe is unavailable or inconclusive).**
+   When the app-server probe throws, times out, or returns no corroborated
+   evidence, the adapter makes exactly one deterministic parse attempt —
+   `capacityFromReportedText` — against the failed session's own reported
+   `error`/`turn.failed` text. It recognizes only this fixed, literal Codex
+   usage-limit template, with the reset clause as its one variable:
+
+   ```
+   You've hit your usage limit.
+   To get more access now, send a request to your admin or try again at <clause>.
+   ```
+
+   `<clause>` must be exactly one bare clock time (e.g. `12:16 PM`) or one
+   bare month-day (e.g. `Jul 22nd`); the adapter resolves it to the nearest
+   strictly-future UTC occurrence anchored to that session's own
+   `observed_at` time. Any text outside this exact template — multiple
+   candidate dates, a missing reset clause, unrecognized wording, a
+   non-Codex error shape, or a clause resolving to an ambiguous or non-future
+   time (e.g. `Feb 29th` in a non-leap year) — is **not** corroborated and
+   fails closed into the same hard-failure Result as today, without
+   consuming a fallback step. The fallback performs no process spawn,
+   network call, or file read of its own; it only re-reads the text already
+   captured from the app-server probe attempt.
+
+Missing app-server support and a non-matching fallback parse together cover
+an unreadable thread, a stale or absent reset, credit-only exhaustion, and
+all non-usage errors, which remain ordinary failures for operator
+inspection. Claude's structured deferral behavior is unchanged.
 
 Mixed-vendor example — bind different Roles to different providers in one
 Assignment file:

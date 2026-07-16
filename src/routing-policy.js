@@ -1,3 +1,4 @@
+import { validateCandidateCooldownRecord } from "./routing-cooldowns.js";
 import { validateRoutingConfig } from "./routing.js";
 
 // Pure candidate selection. This module performs no file I/O, Worker launch,
@@ -5,6 +6,7 @@ import { validateRoutingConfig } from "./routing.js";
 // every output is a deterministic function of those inputs.
 
 const IDENTIFIER = /^[a-z0-9][a-z0-9._-]*$/;
+const TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 const TASK_ID = /^task-[0-9]{4,}$/;
 const TASK_SELECTOR = /^(?:\*|task-[0-9]{4,})$/;
 const ROUTED_ROLES = new Set(["implementer", "reviewer"]);
@@ -97,6 +99,7 @@ const OVERRIDE_DISPLACEABLE = new Set(OVERRIDE_DISPLACEABLE_REASON_CODES);
 // candidate any of them removed.
 export const SELECTION_REASON_CODES = Object.freeze([
   "candidate_disabled",
+  "candidate_cooldown_active",
   "role_ineligible",
   "prior_step_candidate",
   "capability_missing",
@@ -244,6 +247,17 @@ function identifier(value, label) {
     fail(label, `must be a lowercase identifier, got ${String(value)}`);
   }
   return value;
+}
+
+function timestamp(value, label) {
+  if (typeof value !== "string" || !TIMESTAMP.test(value)) {
+    fail(label, "must be an ISO timestamp");
+  }
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds)) {
+    fail(label, "must be an ISO timestamp");
+  }
+  return new Date(milliseconds).toISOString();
 }
 
 export function validateDecisionKey(key) {
@@ -612,6 +626,33 @@ function validateHistory(history, config, currentKey) {
   return normalized;
 }
 
+// Validated cooldown input: a set of caller-supplied, schema-validated
+// candidate-cooldown records (src/routing-cooldowns.js) plus the "as of"
+// observation time the caller already resolved. Selection never reads a
+// clock itself; expiry is purely a comparison against the supplied instant.
+function validateCooldowns(cooldowns, asOf, config) {
+  if (!Array.isArray(cooldowns)) {
+    fail("cooldowns", "must be an array");
+  }
+  const candidateIds = new Set(config.candidates.map((candidate) => candidate.id));
+  const byCandidate = new Map();
+  cooldowns.forEach((entry, index) => {
+    const label = `cooldowns[${index}]`;
+    const record = validateCandidateCooldownRecord(entry, label);
+    if (!candidateIds.has(record.candidate)) {
+      fail(`${label}.candidate`, `references unknown candidate ${record.candidate}`);
+    }
+    if (byCandidate.has(record.candidate)) {
+      fail(label, `duplicates cooldown candidate ${record.candidate}`);
+    }
+    byCandidate.set(record.candidate, record);
+  });
+  if (byCandidate.size === 0) {
+    return { asOf: null, byCandidate };
+  }
+  return { asOf: timestamp(asOf, "asOf"), byCandidate };
+}
+
 function validateImplementerDecision(decision, key, config, tierRanks) {
   if (decision === null) {
     return null;
@@ -852,11 +893,14 @@ export function selectCandidate({
   implementerDecision = null,
   recovery = null,
   override = null,
+  cooldowns = [],
+  asOf = null,
 }) {
   const normalizedConfig = validateRoutingConfig(config);
   const validatedKey = validateDecisionKey(key);
   validateWorkload(workload, validatedKey, normalizedConfig);
   const priorDecisions = validateHistory(history, normalizedConfig, validatedKey);
+  const normalizedCooldowns = validateCooldowns(cooldowns, asOf, normalizedConfig);
   const tierRanks = new Map(normalizedConfig.tiers.map(({ id, rank }) => [id, rank]));
   const decision = validateImplementerDecision(
     implementerDecision,
@@ -991,6 +1035,10 @@ export function selectCandidate({
       const reasons = [];
       if (!candidate.enabled) {
         reasons.push("candidate_disabled");
+      }
+      const cooldown = normalizedCooldowns.byCandidate.get(candidate.id);
+      if (cooldown !== undefined && cooldown.retry_at > normalizedCooldowns.asOf) {
+        reasons.push("candidate_cooldown_active");
       }
       if (!candidate.roles.includes(validatedKey.role)) {
         reasons.push("role_ineligible");

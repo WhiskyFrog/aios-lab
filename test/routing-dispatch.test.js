@@ -8,8 +8,24 @@ import { stringify } from "yaml";
 
 import { TaskStore } from "../src/documents.js";
 import { LoopEngine } from "../src/engine.js";
+import { candidateCooldownsPath } from "../src/routing-cooldown-store.js";
+import { CANDIDATE_COOLDOWNS_SCHEMA } from "../src/routing-cooldowns.js";
 import { routingDecisionsPath } from "../src/routing-ledger.js";
 import { FileAssignmentResolver } from "../src/workers.js";
+
+async function seedCooldowns(root, cooldowns) {
+  const filePath = candidateCooldownsPath(root);
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await writeFile(
+    filePath,
+    `${JSON.stringify(
+      { schema: CANDIDATE_COOLDOWNS_SCHEMA, updated_at: "2026-07-16T00:00:00.000Z", cooldowns },
+      null,
+      2,
+    )}\n`,
+    "utf8",
+  );
+}
 
 const TASK_ID = "task-9800";
 const fixture = path.join(
@@ -463,4 +479,83 @@ test("exact repeated Attempt evidence escalates to a stronger unused candidate",
       ["premium", "repeated_evidence"],
     ],
   );
+});
+
+test("a corroborated capacity event records a cooldown for the failing candidate", async (t) => {
+  const routingConfig = config([
+    candidate("a-implementer", "alpha", ["implementer"], "deferred"),
+    candidate("b-implementer", "beta", ["implementer"], "fresh-loop"),
+    candidate("c-reviewer", "gamma", ["reviewer"], "auto-loop"),
+    candidate("d-reviewer", "delta", ["reviewer"], "auto-loop"),
+  ]);
+  const { root, configPath } = await repository(t, routingConfig);
+  const assignments = new FileAssignmentResolver(configPath, { cwd: root });
+  const before = Date.now();
+
+  const outcome = await new LoopEngine({ root, assignments }).run(TASK_ID);
+
+  assert.equal(outcome.kind, "done");
+  const cooldowns = JSON.parse(await readFile(candidateCooldownsPath(root), "utf8"));
+  assert.equal(cooldowns.schema, CANDIDATE_COOLDOWNS_SCHEMA);
+  assert.equal(cooldowns.cooldowns.length, 1);
+  const [cooldown] = cooldowns.cooldowns;
+  assert.equal(cooldown.candidate, "a-implementer");
+  assert.equal(cooldown.reason_code, "capacity");
+  assert.ok(Date.parse(cooldown.retry_at) > before);
+  assert.match(cooldown.evidence, /Worker capacity is unavailable until/);
+});
+
+test("an active cooldown skips the cooled-down candidate with the correct audit reason", async (t) => {
+  const routingConfig = config([
+    candidate("a-implementer", "alpha", ["implementer"], "fresh-loop"),
+    candidate("b-implementer", "beta", ["implementer"], "fresh-loop"),
+    candidate("c-reviewer", "gamma", ["reviewer"], "auto-loop"),
+  ]);
+  const { root, configPath } = await repository(t, routingConfig);
+  await seedCooldowns(root, [
+    {
+      candidate: "a-implementer",
+      retry_at: new Date(Date.now() + 3_600_000).toISOString(),
+      reason_code: "capacity",
+      evidence: "capacity exhausted after 3 consecutive attempts",
+    },
+  ]);
+  const assignments = new FileAssignmentResolver(configPath, { cwd: root });
+
+  const outcome = await new LoopEngine({ root, assignments }).run(TASK_ID);
+
+  assert.equal(outcome.kind, "done");
+  const ledger = JSON.parse(await readFile(routingDecisionsPath(root), "utf8"));
+  const implementer = ledger.decisions.find((entry) => entry.key.role === "implementer");
+  assert.equal(implementer.chosen.candidate, "b-implementer");
+  const consideredA = implementer.considered.find((entry) => entry.candidate === "a-implementer");
+  assert.deepEqual(consideredA.reasons, ["candidate_cooldown_active"]);
+  assert.equal(consideredA.eligible, false);
+});
+
+test("an expired cooldown no longer blocks selection", async (t) => {
+  const routingConfig = config([
+    candidate("a-implementer", "alpha", ["implementer"], "fresh-loop"),
+    candidate("c-reviewer", "gamma", ["reviewer"], "auto-loop"),
+  ]);
+  const { root, configPath } = await repository(t, routingConfig);
+  await seedCooldowns(root, [
+    {
+      candidate: "a-implementer",
+      retry_at: new Date(Date.now() - 3_600_000).toISOString(),
+      reason_code: "capacity",
+      evidence: "capacity exhausted after 3 consecutive attempts",
+    },
+  ]);
+  const assignments = new FileAssignmentResolver(configPath, { cwd: root });
+
+  const outcome = await new LoopEngine({ root, assignments }).run(TASK_ID);
+
+  assert.equal(outcome.kind, "done");
+  const ledger = JSON.parse(await readFile(routingDecisionsPath(root), "utf8"));
+  const implementer = ledger.decisions.find((entry) => entry.key.role === "implementer");
+  assert.equal(implementer.chosen.candidate, "a-implementer");
+  const considered = implementer.considered.find((entry) => entry.candidate === "a-implementer");
+  assert.deepEqual(considered.reasons, []);
+  assert.equal(considered.eligible, true);
 });

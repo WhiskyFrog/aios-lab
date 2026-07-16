@@ -1,0 +1,14 @@
+---
+schema: aios.review/v1
+id: review-0051
+project: aios-lab
+task: task-0035
+attempt: 1
+verdict: pass
+---
+
+# Review of task-0035, Attempt 1
+
+## Findings
+
+All acceptance criteria verified against the actual repository, not just the Attempt text. PLAN.md has valid aios.plan/v1 front matter (profile: software-feature, which is registered in src/plans.js) with a substantive non-empty profile_reason, and contains all five required non-empty sections (Brief, Profile Application, Assumptions and Risks, Decomposition Rationale, Execution Order). P-01..P-04 are contiguous, schema-valid aios.task/v1 documents (state: implement, retry {count:0,limit:2}, approval: required, last_review: null, Attempts: '_None yet._'); grepping all four files for 'P-0[0-9]' shows no cross-proposal references outside each file's own front-matter id, so relationships/ordering live only in PLAN.md, consistent with the mechanical check used in prior reviews (e.g. review-0016). Independently re-ran `node src/cli.js adopt plans/capacity-recovery-operations --root . --check`, which returned {"kind":"checked","plan":"capacity-recovery-operations","profile":"software-feature","proposals":["P-01","P-02","P-03","P-04"]} exit 0, matching the Attempt's Verification text; `git status` before and after the check was identical, confirming non-mutation. Spot-checked the plan's technical claims against the real codebase: fixtures/codex-usage-limit.ndjson exists, workers/codex-capacity.mjs exports queryCodexCapacity/capacityFromAppServer as described, src/routing-policy.js exports SELECTION_REASON_CODES and OVERRIDE_DISPLACEABLE_REASON_CODES matching P-02's described gate mechanism, and the plan correctly references dogfooding findings 2-5 and the finding-9 symmetric-validation lesson from commit 11a84e0. Constraints satisfied: git status shows only plans/capacity-recovery-operations/ was added by this attempt (the other untracked entries — .aios/tasks/task-0035.md, .aios/approvals/task-0035, .aios/assignments.windows.json.bak, .mcp.json — predate this Attempt and are unrelated loop/session artifacts, not writes made by the Planner); nothing under .aios/ was touched; no provider/model requirements, credentials, or user-local paths appear anywhere in the plan files (grepped for /home/, /mnt/c, C:\\, and username strings — no matches); no Worker dispatch or provider capacity spend occurred. Decomposition quality is sound: the four-way split (widened corroboration / cooldown contract+gate / cooldown persistence+CLI / ledger reset) matches the Brief's three findings while keeping the pure-selection-engine change isolable from file I/O and CLI concerns, and each proposal's own Acceptance Criteria are concrete and independently testable with fakes/fixtures only, matching the Brief's verification constraint.

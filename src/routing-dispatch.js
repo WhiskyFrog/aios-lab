@@ -3,6 +3,11 @@ import path from "node:path";
 
 import { TaskStore } from "./documents.js";
 import {
+  candidateCooldownsPath,
+  CandidateCooldownStore,
+} from "./routing-cooldown-store.js";
+import {
+  currentGenerationDecisions,
   decisionRecordFromSelection,
   normalizeFailureReason,
   RoutingDecisionLedger,
@@ -67,8 +72,14 @@ export function routingPolicyRevision(config) {
     .slice(0, 20)}`;
 }
 
-function historyProjection(decisions) {
-  return decisions.map((record) => ({
+// Only a key's current generation ever feeds policy evaluation: once a route
+// reset supersedes every row of a partial key's sequence, that closed
+// generation must not appear in history alongside a fresh selection at the
+// current policy revision, or validateHistory raises the same
+// policy-revision conflict the reset exists to clear (see resetAction in
+// routing-ledger.js).
+export function historyProjection(decisions) {
+  return currentGenerationDecisions(decisions).map((record) => ({
     key: structuredClone(record.key),
     step: record.step,
     chosen: {
@@ -197,6 +208,7 @@ class RoutedWorker {
     key,
     selection,
     decisionLedger,
+    cooldownStore,
     sessionLedger,
     store,
     timeoutMs,
@@ -212,6 +224,7 @@ class RoutedWorker {
     this.key = key;
     this.selection = selection;
     this.decisionLedger = decisionLedger;
+    this.cooldownStore = cooldownStore;
     this.sessionLedger = sessionLedger;
     this.store = store;
     this.timeoutMs = timeoutMs;
@@ -291,7 +304,30 @@ class RoutedWorker {
     });
   }
 
-  async #advance(task, reason, diagnostic) {
+  // Loads current cooldown state and prunes entries whose retry_at is at or
+  // before the observation time before use: an expired cooldown never
+  // blocks selection, and only a later write against this store drops it
+  // from the persisted file.
+  async #activeCooldowns(asOf) {
+    return this.cooldownStore.activeCooldowns(asOf);
+  }
+
+  // Records or refreshes the failing candidate's cooldown from a
+  // corroborated capacity retry_at, alongside (never instead of) the
+  // capacity-pause routing-decision event. This store is independent of the
+  // routing-decision ledger and is never rewritten or read by it.
+  async #recordCooldown(retryAt, diagnostic) {
+    const snapshot = await this.cooldownStore.load();
+    await this.cooldownStore.recordCooldown(snapshot, {
+      candidate: this.selection.chosen.candidate,
+      retry_at: retryAt,
+      reason_code: "capacity",
+      evidence: diagnostic,
+      observed_at: new Date().toISOString(),
+    });
+  }
+
+  async #advance(task, reason, diagnostic, retryAt = null) {
     if (!(await this.store.taskIsUnchanged(task))) {
       throw new WorkerError(
         "Task changed before routed fallback; no additional Worker was launched",
@@ -305,6 +341,9 @@ class RoutedWorker {
       this.selection.override != null && this.selection.override.allow_fallback === false;
     if (reason === "capacity") {
       await this.#event("capacity_pause", reason, diagnostic);
+      if (retryAt !== null) {
+        await this.#recordCooldown(retryAt, diagnostic);
+      }
       if (overrideDeniesFallback) {
         return false;
       }
@@ -319,6 +358,8 @@ class RoutedWorker {
     }
     const config = await this.#freshConfig();
     let snapshot = await this.decisionLedger.load();
+    const asOf = new Date().toISOString();
+    const cooldowns = await this.#activeCooldowns(asOf);
     let next;
     try {
       next = selectCandidate({
@@ -331,6 +372,8 @@ class RoutedWorker {
           reason_code: reason,
           previous_candidate: this.selection.chosen.candidate,
         },
+        cooldowns,
+        asOf,
       });
     } catch (error) {
       if (reason === "capacity" && recoveryError(error)) {
@@ -435,7 +478,8 @@ class RoutedWorker {
         if (reason === null) {
           throw error;
         }
-        const advanced = await this.#advance(task, reason, error.message);
+        const retryAt = reason === "capacity" ? error.retryAt : null;
+        const advanced = await this.#advance(task, reason, error.message, retryAt);
         if (!advanced) {
           this.deferredCandidate = candidate.id;
           throw error;
@@ -454,6 +498,7 @@ export class RoutedAssignmentResolver {
       timeoutMs = 300_000,
       ledger = null,
       decisionLedger = null,
+      cooldownStore = null,
       store = null,
       routeOverrides = [],
     } = {},
@@ -465,6 +510,8 @@ export class RoutedAssignmentResolver {
       ledger ?? new SessionLedger(path.join(this.root, ".aios", "runtime", "sessions.json"));
     this.decisionLedger =
       decisionLedger ?? new RoutingDecisionLedger(routingDecisionsPath(this.root));
+    this.cooldownStore =
+      cooldownStore ?? new CandidateCooldownStore(candidateCooldownsPath(this.root));
     this.store = store ?? new TaskStore(this.root);
     this.routeOverrides = Object.freeze(structuredClone([...routeOverrides]));
     this.lastRoutingSummary = null;
@@ -537,6 +584,8 @@ export class RoutedAssignmentResolver {
     let selectionReason = null;
     if (existing === null) {
       const implementerDecision = implementerDecisionFor(snapshot.decisions, key);
+      const asOf = new Date().toISOString();
+      const cooldowns = await this.cooldownStore.activeCooldowns(asOf);
       selection = selectCandidate({
         config: loaded.config,
         workload,
@@ -544,6 +593,8 @@ export class RoutedAssignmentResolver {
         history: historyProjection(snapshot.decisions),
         implementerDecision,
         override: requestedOverride,
+        cooldowns,
+        asOf,
       });
       const timestamp = new Date().toISOString();
       snapshot = await this.decisionLedger.record(
@@ -588,6 +639,7 @@ export class RoutedAssignmentResolver {
       key,
       selection,
       decisionLedger: this.decisionLedger,
+      cooldownStore: this.cooldownStore,
       sessionLedger: this.sessionLedger,
       store: this.store,
       timeoutMs: this.timeoutMs,

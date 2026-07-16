@@ -51,6 +51,7 @@ export const FAILURE_REASON_CODES = Object.freeze([
   "worker_reported_failure",
   "invalid_result",
   "routing_exhausted",
+  "policy_changed",
 ]);
 export const ROUTING_EVENT_KINDS = Object.freeze([
   "launch",
@@ -60,7 +61,14 @@ export const ROUTING_EVENT_KINDS = Object.freeze([
   "escalation",
   "completion",
   "exhausted",
+  "reset",
 ]);
+// The fixed reason code an operator route reset always records, alongside
+// the supplied or default diagnostic text, as the explicit audit trail that
+// distinguishes a policy-revision reset from every other terminal outcome.
+export const POLICY_CHANGED_REASON_CODE = "policy_changed";
+const DEFAULT_RESET_REASON =
+  "Routing policy revision changed; action reset by operator";
 const FAILURE_CODES = new Set(FAILURE_REASON_CODES);
 const EVENT_KINDS = new Set(ROUTING_EVENT_KINDS);
 // Reason codes that advance a route by escalation rather than fallback,
@@ -1117,11 +1125,15 @@ function validateLedger(value) {
   const decisions = value.decisions.map((entry, index) =>
     validateDecisionRecord(entry, `Routing decision ${index}`),
   );
+  // Every partial key (task, role, attempt) tracks the one decision sequence
+  // currently open for it. A sequence's steps must be contiguous from 0; a
+  // step-0 row may only start an unrelated new sequence once every row of
+  // the previous one has been superseded by a route reset (resetAction is
+  // the only writer that ever produces that status), which is exactly the
+  // generation split currentGenerationRows also relies on.
   const stepsByKey = new Map();
   decisions.forEach((record, index) => {
-    const keyString = decisionKeyString(record.key);
     const partialKey = `${record.key.task}:${record.key.role}:${record.key.attempt}`;
-    const existing = stepsByKey.get(partialKey);
     if (index > 0 && record.recorded_at < decisions[index - 1].recorded_at) {
       fail(`Routing decision ${index}.recorded_at`, "must preserve append chronology");
     }
@@ -1146,32 +1158,31 @@ function validateLedger(value) {
         );
       }
     }
-    if (existing === undefined) {
-      stepsByKey.set(partialKey, {
-        policy_revision: record.key.policy_revision,
-        steps: [record.step],
-      });
-    } else {
-      if (existing.policy_revision !== record.key.policy_revision) {
+    const tracked = stepsByKey.get(partialKey);
+    if (record.step === 0) {
+      if (tracked !== undefined && !tracked.rows.every((row) => row.status === "superseded")) {
         fail(
           `Routing decision ${index}`,
-          `conflicts with another policy revision for ${partialKey}`,
+          `restarts ${partialKey} at step 0 while its current decision sequence is still open`,
         );
       }
-      if (existing.steps.includes(record.step)) {
-        fail(`Routing decision ${index}`, `duplicates ${keyString} step ${record.step}`);
-      }
-      existing.steps.push(record.step);
+      stepsByKey.set(partialKey, { policy_revision: record.key.policy_revision, rows: [record] });
+      return;
     }
+    if (tracked === undefined) {
+      fail(`Routing decision ${index}`, `must start ${partialKey} at step 0`);
+    }
+    if (record.step !== tracked.rows.length) {
+      fail(`Routing decision ${index}`, `has a non-contiguous step for ${partialKey}`);
+    }
+    if (record.key.policy_revision !== tracked.policy_revision) {
+      fail(
+        `Routing decision ${index}`,
+        `conflicts with another policy revision for ${partialKey}`,
+      );
+    }
+    tracked.rows.push(record);
   });
-  for (const [partialKey, entry] of stepsByKey) {
-    const sorted = [...entry.steps].sort((a, b) => a - b);
-    sorted.forEach((step, index) => {
-      if (step !== index) {
-        fail("Routing decision ledger", `has non-contiguous steps for ${partialKey}`);
-      }
-    });
-  }
   const latestObserved = decisions.reduce(
     (latest, record) =>
       latest === null || record.observed_at > latest ? record.observed_at : latest,
@@ -1215,6 +1226,53 @@ function validateSnapshot(snapshot) {
     fail("Routing ledger snapshot", "fields do not correspond to snapshot.raw");
   }
   return snapshot;
+}
+
+// The rows forming a partial key's current decision sequence: everything
+// recorded since (and including) its most recent step-0 row. A route reset
+// is the only operation that ever supersedes every row of an open sequence
+// at once, so a later step-0 row for the same partial key only ever follows
+// a sequence that is entirely superseded; splitting on the last step 0 finds
+// the live sequence without inspecting status at all. See resetAction,
+// record, and resolveKey.
+function currentGenerationRows(decisions, task, role, attempt) {
+  const rows = decisions.filter(
+    (record) => record.key.task === task && record.key.role === role && record.key.attempt === attempt,
+  );
+  let start = -1;
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    if (rows[index].step === 0) {
+      start = index;
+      break;
+    }
+  }
+  return start === -1 ? [] : rows.slice(start);
+}
+
+// The subset of `decisions` that belongs to each partial key's current, still
+// open generation (see currentGenerationRows and resolveKey), in original
+// order. A generation every route reset has fully superseded is dropped
+// entirely for its key here, exactly as resolveKey resolves it as null: a
+// caller that projects a full ledger snapshot into policy-evaluation input
+// (history) must filter through this first, or a reset key's closed,
+// old-revision rows still collide with a fresh selection at the current
+// policy revision.
+export function currentGenerationDecisions(decisions) {
+  const partialKeys = new Set(
+    decisions.map((record) => JSON.stringify([record.key.task, record.key.role, record.key.attempt])),
+  );
+  const kept = new Set();
+  for (const partialKey of partialKeys) {
+    const [task, role, attempt] = JSON.parse(partialKey);
+    const rows = currentGenerationRows(decisions, task, role, attempt);
+    if (rows.length === 0 || rows.every((row) => row.status === "superseded")) {
+      continue;
+    }
+    for (const row of rows) {
+      kept.add(row);
+    }
+  }
+  return decisions.filter((record) => kept.has(record));
 }
 
 function findRecordIndex(decisions, key, step) {
@@ -1320,18 +1378,32 @@ export class RoutingDecisionLedger {
         `Refusing to rewrite recorded decision ${decisionKeyString(record.key)} step ${record.step}`,
       );
     }
-    const keyRows = snapshot.decisions.filter(
-      (entry) =>
-        entry.key.task === record.key.task &&
-        entry.key.role === record.key.role &&
-        entry.key.attempt === record.key.attempt,
+    // A row only ever joins the partial key's current, still-open decision
+    // sequence (see currentGenerationRows). Once a route reset has
+    // superseded every row of that sequence, it is closed: the next record
+    // for the same partial key must start an unrelated sequence at step 0,
+    // free of the old sequence's policy revision, exactly as if the action
+    // had never run before.
+    const generationRows = currentGenerationRows(
+      snapshot.decisions,
+      record.key.task,
+      record.key.role,
+      record.key.attempt,
     );
-    if (keyRows.some((entry) => entry.key.policy_revision !== record.key.policy_revision)) {
-      throw new RoutingLedgerError(
-        `Policy revision mismatch for ${record.key.task}:${record.key.role}:${record.key.attempt}`,
-      );
-    }
-    if (record.step !== keyRows.length) {
+    const openSequence =
+      generationRows.length > 0 && generationRows.some((entry) => entry.status !== "superseded");
+    if (openSequence) {
+      if (generationRows.some((entry) => entry.key.policy_revision !== record.key.policy_revision)) {
+        throw new RoutingLedgerError(
+          `Policy revision mismatch for ${record.key.task}:${record.key.role}:${record.key.attempt}`,
+        );
+      }
+      if (record.step !== generationRows.length) {
+        throw new RoutingLedgerError(
+          `Decision ${decisionKeyString(record.key)} step ${record.step} is not the next step`,
+        );
+      }
+    } else if (record.step !== 0) {
       throw new RoutingLedgerError(
         `Decision ${decisionKeyString(record.key)} step ${record.step} is not the next step`,
       );
@@ -1524,19 +1596,23 @@ export class RoutingDecisionLedger {
     });
   }
 
-  // Exact-key resolution. The recorded active candidate is returned for the
-  // same policy revision even when newer ledger rows changed distribution; a
-  // different revision for the same Task/Role action fails closed.
+  // Exact-key resolution over the partial key's current decision sequence.
+  // The recorded active candidate is returned for the same policy revision
+  // even when newer ledger rows changed distribution; a different revision
+  // for the same still-open sequence fails closed. A sequence every route
+  // reset has fully superseded resolves as null — exactly as if the action
+  // had never run — so a fresh selection can proceed under the current
+  // policy revision without disturbing the superseded rows.
   async resolveKey(key) {
     const validatedKey = validateDecisionKey(key);
     const state = await this.load();
-    const rows = state.decisions.filter(
-      (record) =>
-        record.key.task === validatedKey.task &&
-        record.key.role === validatedKey.role &&
-        record.key.attempt === validatedKey.attempt,
+    const rows = currentGenerationRows(
+      state.decisions,
+      validatedKey.task,
+      validatedKey.role,
+      validatedKey.attempt,
     );
-    if (rows.length === 0) {
+    if (rows.length === 0 || rows.every((record) => record.status === "superseded")) {
       return null;
     }
     if (rows.some((record) => record.key.policy_revision !== validatedKey.policy_revision)) {
@@ -1549,6 +1625,77 @@ export class RoutingDecisionLedger {
       key_string: decisionKeyString(validatedKey),
       steps,
       active: steps[steps.length - 1],
+    });
+  }
+
+  // The operator recovery command: supersedes every row of a stranded
+  // action's current decision sequence in one atomic compare-and-swap write,
+  // so the same partial key can start an unrelated sequence at step 0 under
+  // the active policy revision. Refuses closed when any row of the sequence
+  // is unknown or already completed/superseded, and never touches, rewrites,
+  // or reattaches an override to any existing row.
+  async resetAction(snapshot, { task, role, attempt, reason = null, observed_at }) {
+    validateSnapshot(snapshot);
+    if (typeof task !== "string" || !TASK_ID.test(task)) {
+      fail("reset.task", `must be a Task id, got ${String(task)}`);
+    }
+    enumValue(role, ROUTED_ROLES, "reset.role");
+    positiveInteger(attempt, "reset.attempt");
+    const observedAt = timestamp(observed_at, "reset.observed_at");
+    const partialKey = `${task}:${role}:${attempt}`;
+    const normalizedReason = normalizeFailureReason(
+      POLICY_CHANGED_REASON_CODE,
+      reason === null || reason === undefined || reason === "" ? DEFAULT_RESET_REASON : reason,
+    );
+
+    const rows = currentGenerationRows(snapshot.decisions, task, role, attempt);
+    if (rows.length === 0) {
+      fail("reset", `no recorded routing decision exists for ${partialKey}`);
+    }
+    const blocking = rows.find(
+      (row) => row.status !== "selected" && row.status !== "dispatched" && row.status !== "failed",
+    );
+    if (blocking !== undefined) {
+      fail(
+        "reset",
+        `${partialKey} step ${blocking.step} is already ${blocking.status} and cannot be reset`,
+      );
+    }
+    for (const row of rows) {
+      if (observedAt < row.observed_at) {
+        fail(
+          "reset.observed_at",
+          `cannot be before ${partialKey} step ${row.step}'s existing observed_at`,
+        );
+      }
+    }
+    const resetRows = new Set(rows);
+    const decisions = snapshot.decisions.map((record) => {
+      if (!resetRows.has(record)) {
+        return record;
+      }
+      const event = {
+        sequence: record.events.length,
+        kind: "reset",
+        reason: normalizedReason,
+        session_id: null,
+        observed_at: observedAt,
+      };
+      return {
+        ...record,
+        status: "superseded",
+        events: [...record.events, event],
+        observed_at: observedAt,
+      };
+    });
+    const updatedAt =
+      snapshot.updated_at === null || observedAt > snapshot.updated_at
+        ? observedAt
+        : snapshot.updated_at;
+    return this.#commit(snapshot, {
+      schema: ROUTING_DECISIONS_SCHEMA,
+      updated_at: updatedAt,
+      decisions,
     });
   }
 

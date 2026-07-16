@@ -6,10 +6,14 @@
 // aios.worker-execution/v1 JSON object on stdout. This adapter runs one
 // non-interactive `codex exec --json` session for the Role, interprets its
 // final message with the shared extraction and validation rules, and reports
-// public thread and usage telemetry. On a failed turn, the adapter asks the
-// same Codex launcher's app-server for structured turn-error and rate-limit
-// evidence. It defers only a corroborated usageLimitExceeded turn with a
-// provider-supplied future reset; human-readable error prose is never parsed.
+// public thread and usage telemetry. On a failed turn, the adapter first asks
+// the same Codex launcher's app-server for structured turn-error and
+// rate-limit evidence and defers a corroborated usageLimitExceeded turn with
+// a provider-supplied future reset. Only when that structured probe is
+// unavailable or inconclusive does the adapter fall back to one deterministic
+// parse of that session's own reported text against the fixed Codex
+// usage-limit grammar (capacityFromReportedText in workers/codex-capacity.mjs);
+// any text outside that exact grammar remains a hard failure.
 //
 // Usage in an Assignment: ["node", "workers/codex-worker.mjs", "<codex-cli...>"]
 // The trailing argv tokens (or AIOS_CODEX_CLI) name the Codex launcher: a
@@ -34,7 +38,7 @@ import {
   validatePayload,
   WorkerFailure,
 } from "./worker-shared.mjs";
-import { queryCodexCapacity } from "./codex-capacity.mjs";
+import { capacityFromReportedText, queryCodexCapacity } from "./codex-capacity.mjs";
 
 const SANDBOX_BY_ROLE = {
   implementer: "workspace-write",
@@ -283,22 +287,25 @@ export function buildWorkerExecution({
       `Codex resumed session ${parsed.thread_id} instead of expected session ${expectedSessionId}`,
     );
   }
-  if (
-    parsed.failed !== null &&
-    isObject(capacityEvidence) &&
-    nonEmptyString(capacityEvidence.retry_at) &&
-    isObject(capacityEvidence.capacity)
-  ) {
-    return execution(
-      null,
-      "capacity_deferred",
-      capacityEvidence.capacity,
-      {
-        kind: "capacity",
-        retry_at: capacityEvidence.retry_at,
-        continuation: parsed.thread_id,
-      },
-    );
+  if (parsed.failed !== null) {
+    const corroborated =
+      isObject(capacityEvidence) &&
+      nonEmptyString(capacityEvidence.retry_at) &&
+      isObject(capacityEvidence.capacity)
+        ? capacityEvidence
+        : capacityFromReportedText(reportedError(parsed), observedAt);
+    if (corroborated !== null) {
+      return execution(
+        null,
+        "capacity_deferred",
+        corroborated.capacity,
+        {
+          kind: "capacity",
+          retry_at: corroborated.retry_at,
+          continuation: parsed.thread_id,
+        },
+      );
+    }
   }
   const sessionError = reportedError(parsed);
   if (sessionError !== null) {

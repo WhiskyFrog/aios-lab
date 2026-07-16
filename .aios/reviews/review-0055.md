@@ -1,0 +1,16 @@
+---
+schema: aios.review/v1
+id: review-0055
+project: aios-lab
+task: task-0039
+attempt: 1
+verdict: changes_requested
+---
+
+# Review of task-0039, Attempt 1
+
+## Findings
+
+Blocking (AC3 / Objective not met end-to-end): after a successful `aios route reset`, the real dispatch path that `aios run`/`aios progress` uses to make the next selection still throws the exact policy-revision conflict the Task exists to fix. `RoutingDecisionLedger.resolveKey`/`record` were made generation-aware (via `currentGenerationRows`), and those two methods alone do accept a fresh selection when called directly — that part is correctly implemented and covered by test/routing-reset.test.js. But `routing-dispatch.js`'s `existing===null` branch (~line 578-591) and its retry branch (~line 351-368) both call `selectCandidate({..., history: historyProjection(snapshot.decisions), ...})` with the *entire unfiltered* `snapshot.decisions` array. `historyProjection` (routing-dispatch.js:74) drops status entirely, and `validateHistory` (routing-policy.js:548-627) groups history rows by partial key and fails with `history: uses another policy revision for <key>` the moment it sees the old, now-superseded generation's row alongside a selection at the new policy revision — it has no concept of generations/superseded status. I reproduced this directly: built a fixture ledger, seeded selected→dispatched→failed, called `ledger.resetAction(...)` (succeeds), then called `selectCandidate` with `historyProjection(snapshot.decisions)` exactly as routing-dispatch.js does — it throws `history: uses another policy revision for task-0099:implementer:1`. So an operator who runs `aios route reset` and then re-runs `aios run`/`aios progress` for that same action hits dogfooding finding 4 again immediately; the hand-editing workaround is not actually eliminated for the primary real-world flow the Task describes in its Objective and Context. The Attempt's author was aware of this and called it 'out of scope,' but AC3 ('a fresh selection for that key can be recorded... exactly as if the action had never run before') and the Objective describe exactly this operator flow, not just isolated `RoutingDecisionLedger` API calls. Notably, test/routing-reset.test.js's own `decoyHistoryRow` helper (with its comment admitting the real superseded row 'would collide') deliberately avoids exercising this real scenario by feeding a decoy history entry under a different attempt number instead of the actual post-reset row — so no test in this Attempt catches the regression. Fix: make `historyProjection`/`validateHistory` (or whatever feeds history into `selectCandidate` post-reset) generation-aware — e.g. filter to the current generation the same way `currentGenerationRows` already does for the ledger itself — and add a test that reproduces the real dispatch call with the actual superseded row present, not a decoy.
+
+Non-blocking: AC1 says exit 1 and AC6 says exit 64 for the identical 'rows not all selected/dispatched/failed' rejection case — these are contradictory as written. The Attempt disclosed this explicitly and followed AC6 plus the pre-existing `route cooldowns`/`route clear-cooldown` exit-64 convention, which is a reasonable resolution of a spec conflict, not an implementation defect.

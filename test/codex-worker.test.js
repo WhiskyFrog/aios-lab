@@ -8,6 +8,7 @@ import test from "node:test";
 
 import {
   capacityFromAppServer,
+  capacityFromReportedText,
   queryCodexCapacity,
 } from "../workers/codex-capacity.mjs";
 import {
@@ -243,6 +244,93 @@ test("capacityFromAppServer waits for every exhausted rate window", () => {
   assert.equal(capacity.retry_at, "2096-10-02T07:06:40.000Z");
 });
 
+const USAGE_LIMIT_CLOCK_TEXT =
+  "You've hit your usage limit.\nTo get more access now, send a request to your admin or try again at 12:16 PM.";
+const USAGE_LIMIT_MONTH_DAY_TEXT =
+  "You've hit your usage limit.\nTo get more access now, send a request to your admin or try again at Jul 22nd.";
+
+test("capacityFromReportedText corroborates the captured real usage-limit clock-time clause", () => {
+  const result = capacityFromReportedText(USAGE_LIMIT_CLOCK_TEXT, "2026-07-14T00:01:00.000Z");
+  assert.deepEqual(result, {
+    retry_at: "2026-07-14T12:16:00.000Z",
+    capacity: {
+      status: "rejected",
+      utilization: 1,
+      resets_at: "2026-07-14T12:16:00.000Z",
+    },
+  });
+});
+
+test("capacityFromReportedText rolls a clock-time clause already past today to tomorrow", () => {
+  const result = capacityFromReportedText(USAGE_LIMIT_CLOCK_TEXT, "2026-07-14T13:00:00.000Z");
+  assert.equal(result.retry_at, "2026-07-15T12:16:00.000Z");
+});
+
+test("capacityFromReportedText corroborates a month-day clause", () => {
+  const result = capacityFromReportedText(USAGE_LIMIT_MONTH_DAY_TEXT, "2026-07-14T00:01:00.000Z");
+  assert.deepEqual(result, {
+    retry_at: "2026-07-22T00:00:00.000Z",
+    capacity: {
+      status: "rejected",
+      utilization: 1,
+      resets_at: "2026-07-22T00:00:00.000Z",
+    },
+  });
+});
+
+test("capacityFromReportedText rolls a month-day clause already past this year to next year", () => {
+  const result = capacityFromReportedText(USAGE_LIMIT_MONTH_DAY_TEXT, "2026-08-01T00:00:00.000Z");
+  assert.equal(result.retry_at, "2027-07-22T00:00:00.000Z");
+});
+
+test("capacityFromReportedText fails closed on any text outside the fixed grammar", () => {
+  const anchor = "2026-07-14T00:01:00.000Z";
+  assert.equal(capacityFromReportedText(null, anchor), null);
+  assert.equal(capacityFromReportedText("", anchor), null);
+  assert.equal(
+    capacityFromReportedText("synthetic Codex failure", anchor),
+    null,
+    "non-Codex-usage-limit error shape",
+  );
+  assert.equal(
+    capacityFromReportedText(
+      "You've hit your usage limit.\nTo get more access now, send a request to your admin.",
+      anchor,
+    ),
+    null,
+    "missing reset clause",
+  );
+  assert.equal(
+    capacityFromReportedText(
+      "You've hit your usage limit.\nTo get more access now, send a request to your admin or try again sometime soon.",
+      anchor,
+    ),
+    null,
+    "unrecognized wording",
+  );
+  assert.equal(
+    capacityFromReportedText(
+      "You've hit your usage limit.\nTo get more access now, send a request to your admin or try again at 12:16 PM or Jul 22nd.",
+      anchor,
+    ),
+    null,
+    "multiple candidate dates",
+  );
+  assert.equal(
+    capacityFromReportedText(
+      "You've hit your usage limit.\nTo get more access now, send a request to your admin or try again at Feb 29th.",
+      anchor,
+    ),
+    null,
+    "ambiguous date (Feb 29 in a non-leap year)",
+  );
+  assert.equal(
+    capacityFromReportedText("Rate limit exceeded, retry later.", anchor),
+    null,
+    "a differently shaped provider error",
+  );
+});
+
 test("queryCodexCapacity performs the app-server handshake with the same launcher", async () => {
   const capacity = await queryCodexCapacity({
     command: [process.execPath, codexFixture],
@@ -298,9 +386,67 @@ test("buildWorkerExecution wraps a completed Result with Codex session telemetry
   });
 });
 
-test("usage-limit prose remains an ordinary failure and never a capacity deferral", async () => {
+test("captured real usage-limit prose is corroborated by the textual fallback when no structured evidence is available", async () => {
   const execution = buildWorkerExecution({
     stdout: await readFile(usageLimitFixture, "utf8"),
+    exitCode: 1,
+    reply: null,
+    taskId: "task-0011",
+    role: "implementer",
+    model: "gpt-5",
+    startedAt: STARTED_AT,
+    observedAt: OBSERVED_AT,
+  });
+  assert.equal(execution.result, null);
+  assert.deepEqual(execution.deferred, {
+    kind: "capacity",
+    retry_at: "2026-07-14T12:16:00.000Z",
+    continuation: "019a77e4-0716-7152-8396-b642e26c3e20",
+  });
+  assert.equal(execution.session.outcome, "capacity_deferred");
+  assert.deepEqual(execution.session.capacity, {
+    status: "rejected",
+    utilization: 1,
+    resets_at: "2026-07-14T12:16:00.000Z",
+  });
+});
+
+test("a month-day usage-limit clause is corroborated by the textual fallback", () => {
+  const message =
+    "You've hit your usage limit.\nTo get more access now, send a request to your admin or try again at Jul 22nd.";
+  const execution = buildWorkerExecution({
+    stdout: ndjson(
+      { type: "thread.started", thread_id: "thread-month-day" },
+      { type: "turn.started" },
+      { type: "error", message },
+      { type: "turn.failed", error: { message } },
+    ),
+    exitCode: 1,
+    reply: null,
+    taskId: "task-0011",
+    role: "implementer",
+    model: "gpt-5",
+    startedAt: STARTED_AT,
+    observedAt: OBSERVED_AT,
+  });
+  assert.equal(execution.result, null);
+  assert.equal(execution.session.outcome, "capacity_deferred");
+  assert.deepEqual(execution.deferred, {
+    kind: "capacity",
+    retry_at: "2026-07-22T00:00:00.000Z",
+    continuation: "thread-month-day",
+  });
+});
+
+test("non-matching, ambiguous, or unrecognized reported text still fails exactly as it does today", () => {
+  const message = "Something else went wrong and there is no admin contact.";
+  const execution = buildWorkerExecution({
+    stdout: ndjson(
+      { type: "thread.started", thread_id: "thread-generic-failure" },
+      { type: "turn.started" },
+      { type: "error", message },
+      { type: "turn.failed", error: { message } },
+    ),
     exitCode: 1,
     reply: null,
     taskId: "task-0011",
@@ -313,10 +459,13 @@ test("usage-limit prose remains an ordinary failure and never a capacity deferra
   assert.equal(execution.session.outcome, "failed");
   assert.equal(execution.session.capacity, null);
   assert.equal(execution.result.status, "failure");
-  assert.match(execution.result.payload.reason, /usage limit/);
+  assert.match(execution.result.payload.reason, /Something else went wrong/);
 });
 
-test("structured app-server evidence turns a failed Codex thread into a deferral", async () => {
+test("structured app-server evidence turns a failed Codex thread into a deferral and wins over the textual fallback", async () => {
+  // stdout here also matches the textual fallback grammar; asserting the
+  // structured capacityEvidence's retry_at (not the fallback's) proves the
+  // structured path is preferred whenever it is available.
   const execution = buildWorkerExecution({
     stdout: await readFile(usageLimitFixture, "utf8"),
     exitCode: 1,
@@ -492,9 +641,34 @@ test("a Codex deferral continuation resumes and completes the exact thread", () 
   assert.equal(resumed.result.status, "success");
 });
 
-test("codex-worker fails closed when the structured capacity probe is unavailable", () => {
+test("codex-worker falls back to the textual usage-limit parse when the structured capacity probe is unavailable", () => {
+  const before = Date.now();
   const run = runAdapter({
     mode: "usage-limit",
+    role: "implementer",
+    taskDocument: TASK_DOCUMENT,
+    appServerMode: "unavailable",
+  });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stderr, /structured capacity probe unavailable/);
+  const execution = JSON.parse(run.stdout);
+  assert.equal(execution.result, null);
+  assert.equal(execution.session.outcome, "capacity_deferred");
+  assert.deepEqual(execution.session.capacity, {
+    status: "rejected",
+    utilization: 1,
+    resets_at: execution.deferred.retry_at,
+  });
+  assert.equal(execution.deferred.continuation, execution.session.id);
+  const retryAtMs = Date.parse(execution.deferred.retry_at);
+  assert.equal(Number.isFinite(retryAtMs), true);
+  assert.equal(retryAtMs > before, true);
+  assert.equal(retryAtMs <= before + 24 * 60 * 60 * 1000, true);
+});
+
+test("codex-worker still fails closed when the structured capacity probe is unavailable and the reported text does not match the usage-limit grammar", () => {
+  const run = runAdapter({
+    mode: "nonzero",
     role: "implementer",
     taskDocument: TASK_DOCUMENT,
     appServerMode: "unavailable",
@@ -503,7 +677,8 @@ test("codex-worker fails closed when the structured capacity probe is unavailabl
   const execution = JSON.parse(run.stdout);
   assert.equal(execution.deferred, null);
   assert.equal(execution.session.outcome, "failed");
-  assert.match(run.stderr, /structured capacity probe unavailable/);
+  assert.equal(execution.session.capacity, null);
+  assert.match(execution.result.payload.reason, /synthetic Codex failure/);
 });
 
 test("codex-worker end to end resumes exactly the supplied continuation", () => {

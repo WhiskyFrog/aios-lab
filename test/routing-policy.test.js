@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   decisionKeyString,
   NoEligibleCandidateError,
+  OVERRIDE_DISPLACEABLE_REASON_CODES,
   RoutingPolicyError,
   selectCandidate,
   validateDecisionKey,
@@ -235,7 +236,18 @@ function choose(options = {}) {
     history: options.history ?? [],
     implementerDecision: options.implementerDecision ?? null,
     override: options.override ?? null,
+    cooldowns: options.cooldowns ?? [],
+    asOf: options.asOf ?? null,
   });
+}
+
+function cooldownRecord({
+  candidate,
+  retryAt,
+  reasonCode = "capacity",
+  evidence = "capacity exhausted",
+} = {}) {
+  return { candidate, retry_at: retryAt, reason_code: reasonCode, evidence };
 }
 
 test("a bounded implementation selects the minimum sufficient lower tier", () => {
@@ -246,6 +258,68 @@ test("a bounded implementation selects the minimum sufficient lower tier", () =>
   assert.equal(selected.fitness.tier_surplus, 0);
   assert.equal(selected.distribution.applied, true);
   assert.ok(Object.isFrozen(selected));
+});
+
+test("a future cooldown retry_at makes a candidate ineligible with exactly one gate reason and reroutes selection", () => {
+  const asOf = "2026-07-16T00:00:00.000Z";
+  const selected = choose({
+    asOf,
+    cooldowns: [
+      cooldownRecord({ candidate: "claude-lower", retryAt: "2026-07-16T00:05:00.000Z" }),
+    ],
+  });
+  const claudeLower = selected.considered.find((entry) => entry.candidate === "claude-lower");
+  assert.equal(claudeLower.eligible, false);
+  assert.deepEqual(claudeLower.reasons, ["candidate_cooldown_active"]);
+  assert.equal(selected.chosen.candidate, "codex-lower");
+});
+
+test("a cooldown retry_at at or before the observation time leaves the candidate fully eligible", () => {
+  for (const retryAt of ["2026-07-16T00:00:00.000Z", "2026-07-15T23:59:59.000Z"]) {
+    const selected = choose({
+      asOf: "2026-07-16T00:00:00.000Z",
+      cooldowns: [cooldownRecord({ candidate: "claude-lower", retryAt })],
+    });
+    const claudeLower = selected.considered.find((entry) => entry.candidate === "claude-lower");
+    assert.equal(claudeLower.eligible, true);
+    assert.deepEqual(claudeLower.reasons, []);
+    assert.equal(selected.chosen.candidate, "claude-lower");
+  }
+});
+
+test("a routing-decision record whose considered row carries candidate_cooldown_active passes validateDecisionRecord", () => {
+  const asOf = "2026-07-16T00:00:00.000Z";
+  const selected = choose({
+    asOf,
+    cooldowns: [
+      cooldownRecord({ candidate: "claude-lower", retryAt: "2026-07-16T00:05:00.000Z" }),
+    ],
+  });
+  const record = initialRecord(selected);
+  const claudeLower = record.considered.find((entry) => entry.candidate === "claude-lower");
+  assert.deepEqual(claudeLower.reasons, ["candidate_cooldown_active"]);
+  assert.equal(record.chosen.candidate, "codex-lower");
+});
+
+test("an operator override cannot restore a cooled-down candidate", () => {
+  assert.ok(!OVERRIDE_DISPLACEABLE_REASON_CODES.includes("candidate_cooldown_active"));
+  assert.throws(
+    () =>
+      choose({
+        asOf: "2026-07-16T00:00:00.000Z",
+        cooldowns: [
+          cooldownRecord({ candidate: "claude-lower", retryAt: "2026-07-16T00:05:00.000Z" }),
+        ],
+        override: {
+          candidate: "claude-lower",
+          source: "cli",
+          selector: { task: "task-9001", role: "implementer" },
+          allow_fallback: false,
+          displaced_config_candidate: null,
+        },
+      }),
+    /violates hard safety gates: candidate_cooldown_active/,
+  );
 });
 
 test("planning, unknown work, and a Reviewer without Implementer evidence stay high tier", () => {

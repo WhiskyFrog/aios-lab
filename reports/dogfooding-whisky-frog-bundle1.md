@@ -85,6 +85,22 @@ Objective: review cards R-03, R-10, R-07, R-14 from the target's
     fails intermittently under full-suite parallel load
     (ENOENT `descendant.pid`), passes standalone. Fixture timing race.
 
+### Addenda from the capacity-recovery-operations cycle (2026-07-16)
+
+16. **A format-invalid final reply discards a completed attempt.** During
+    task-0037 the implementer session finished the work (files + passing
+    tests on disk) but prefixed prose to its final JSON reply; the worker
+    correctly rejected it ("unusable implementer reply"), yet the effect
+    is the same class as finding 1: finished work invisible to the loop,
+    session cost lost. The resume path (fresh session sees on-disk work,
+    verifies, replies) worked, but candidates worth considering: salvage
+    a parseable trailing/embedded JSON object when exactly one exists, or
+    have the worker reprompt once for format-only correction within the
+    same session. A reviewer-side variant followed on task-0039: a
+    substantively valid changes_requested review was rejected as
+    "unusable reviewer reply" on a key-shape violation, discarding real
+    review findings the next session had to rediscover.
+
 ### Operational notes (not engine defects)
 
 12. Capacity stop (`capacity_wait`, exit 5) is opt-out by design without
