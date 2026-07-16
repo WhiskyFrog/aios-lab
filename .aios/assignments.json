@@ -4,12 +4,12 @@
     "implementer": [
       "node",
       "workers/claude-worker.mjs",
-      "C:\\DogFoot\\JS\\NODE\\node_modules\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe"
+      "/home/djejg/.local/bin/claude"
     ],
     "reviewer": [
       "node",
       "workers/claude-worker.mjs",
-      "C:\\DogFoot\\JS\\NODE\\node_modules\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe"
+      "/home/djejg/.local/bin/claude"
     ],
     "approver": [
       "node",

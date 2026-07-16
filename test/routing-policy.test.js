@@ -234,6 +234,7 @@ function choose(options = {}) {
     key: options.key ?? key(),
     history: options.history ?? [],
     implementerDecision: options.implementerDecision ?? null,
+    override: options.override ?? null,
   });
 }
 
@@ -331,6 +332,44 @@ test("Reviewer chooses an equal-or-higher different provider and records same-pr
       RoutingPolicyError,
     );
   }
+});
+
+test("an override pinning a same-provider Reviewer excludes eligible candidates from the disqualified evidence", () => {
+  const reviewerWorkload = workload({
+    role: "reviewer",
+    minimumTier: "high",
+    lowerEligible: false,
+  });
+  const implementerDecision = {
+    task: "task-9001",
+    attempt: 1,
+    candidate: "claude-high",
+    provider: "claude",
+    tier: "high",
+  };
+  const pinned = choose({
+    workload: reviewerWorkload,
+    key: key({ role: "reviewer" }),
+    implementerDecision,
+    override: {
+      candidate: "claude-high",
+      source: "cli",
+      selector: { task: "*", role: "reviewer" },
+      allow_fallback: false,
+      displaced_config_candidate: null,
+    },
+  });
+  assert.equal(pinned.chosen.candidate, "claude-high");
+  assert.equal(pinned.override.policy_winner.candidate, "codex-high");
+  assert.notEqual(pinned.same_provider_review, null);
+  for (const entry of pinned.same_provider_review.cross_provider_disqualified) {
+    assert.ok(entry.reasons.length > 0);
+  }
+  assert.ok(
+    !pinned.same_provider_review.cross_provider_disqualified.some(
+      ({ candidate }) => candidate === "codex-high",
+    ),
+  );
 });
 
 test("hard capability, context, budget, Role, enabled, and tier gates beat distribution", () => {

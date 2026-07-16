@@ -1008,7 +1008,11 @@ export function validateDecisionRecord(value, label = "Routing decision") {
       fail(`${label}.same_provider_review`, "requires a same-provider chosen candidate");
     }
     const expectedDisqualified = value.considered
-      .filter((entry) => entry.provider !== value.same_provider_review.implementer.provider)
+      .filter(
+        (entry) =>
+          entry.provider !== value.same_provider_review.implementer.provider &&
+          entry.reasons.length > 0,
+      )
       .map((entry) => ({ candidate: entry.candidate, reasons: entry.reasons }));
     if (
       JSON.stringify(value.same_provider_review.cross_provider_disqualified) !==

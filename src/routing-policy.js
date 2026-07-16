@@ -1260,8 +1260,14 @@ export function selectCandidate({
               candidate: decision.candidate,
               provider: decision.provider,
             },
+            // Only gate-disqualified candidates belong here: an override may
+            // pin a same-provider reviewer past an eligible cross-provider
+            // candidate, and that displacement is already recorded on the
+            // override row, not as a disqualification.
             cross_provider_disqualified: routedConsidered
-              .filter((entry) => entry.provider !== decision.provider)
+              .filter(
+                (entry) => entry.provider !== decision.provider && entry.reasons.length > 0,
+              )
               .map((entry) => ({ candidate: entry.candidate, reasons: entry.reasons })),
           }
         : null,
