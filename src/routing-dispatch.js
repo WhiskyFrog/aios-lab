@@ -7,8 +7,8 @@ import {
   CandidateCooldownStore,
 } from "./routing-cooldown-store.js";
 import {
-  currentGenerationDecisions,
   decisionRecordFromSelection,
+  distributionHistoryDecisions,
   normalizeFailureReason,
   RoutingDecisionLedger,
   routingDecisionsPath,
@@ -72,14 +72,13 @@ export function routingPolicyRevision(config) {
     .slice(0, 20)}`;
 }
 
-// Only a key's current generation ever feeds policy evaluation: once a route
-// reset supersedes every row of a partial key's sequence, that closed
-// generation must not appear in history alongside a fresh selection at the
-// current policy revision, or validateHistory raises the same
-// policy-revision conflict the reset exists to clear (see resetAction in
+// Append-position generation history invariant: selection receives the
+// shared generation-aware history used by ledger replay. A closed generation
+// does not count, while every other preceding row remains in global
+// distribution order (see distributionHistoryDecisions and resetAction in
 // routing-ledger.js).
 export function historyProjection(decisions) {
-  return currentGenerationDecisions(decisions).map((record) => ({
+  return distributionHistoryDecisions(decisions).map((record) => ({
     key: structuredClone(record.key),
     step: record.step,
     chosen: {

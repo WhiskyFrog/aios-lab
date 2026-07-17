@@ -67,8 +67,10 @@ export const ROUTING_EVENT_KINDS = Object.freeze([
 // the supplied or default diagnostic text, as the explicit audit trail that
 // distinguishes a policy-revision reset from every other terminal outcome.
 export const POLICY_CHANGED_REASON_CODE = "policy_changed";
-const DEFAULT_RESET_REASON =
-  "Routing policy revision changed; action reset by operator";
+// resetAction never requires or infers a policy-revision change (an
+// operator may reset a stuck action with the routing policy unchanged), so
+// this default stays agnostic to whether one accompanied the reset.
+const DEFAULT_RESET_REASON = "Action reset by operator";
 const FAILURE_CODES = new Set(FAILURE_REASON_CODES);
 const EVENT_KINDS = new Set(ROUTING_EVENT_KINDS);
 // Reason codes that advance a route by escalation rather than fallback,
@@ -1137,9 +1139,12 @@ function validateLedger(value) {
     if (index > 0 && record.recorded_at < decisions[index - 1].recorded_at) {
       fail(`Routing decision ${index}.recorded_at`, "must preserve append chronology");
     }
-    const windowRows = decisions.slice(
-      Math.max(0, index - record.distribution.window),
-      index,
+    // Append-position generation history invariant: replay the same shared
+    // generation-aware history used for selection, then take its trailing
+    // window. Closed generations do not count; every other preceding row does
+    // (see distributionHistoryDecisions).
+    const windowRows = distributionHistoryDecisions(decisions, index).slice(
+      -record.distribution.window,
     );
     if (record.distribution.observed !== windowRows.length) {
       fail(
@@ -1249,41 +1254,95 @@ function currentGenerationRows(decisions, task, role, attempt) {
   return start === -1 ? [] : rows.slice(start);
 }
 
-// The subset of `decisions` that belongs to each partial key's current, still
-// open generation (see currentGenerationRows and resolveKey), in original
-// order. A generation every route reset has fully superseded is dropped
-// entirely for its key here, exactly as resolveKey resolves it as null: a
-// caller that projects a full ledger snapshot into policy-evaluation input
-// (history) must filter through this first, or a reset key's closed,
-// old-revision rows still collide with a fresh selection at the current
-// policy revision.
-export function currentGenerationDecisions(decisions) {
-  const partialKeys = new Set(
-    decisions.map((record) => JSON.stringify([record.key.task, record.key.role, record.key.attempt])),
+// Append-position generation history invariant: count every preceding row
+// except rows in a partial key's closed generation, in original order. A
+// generation is closed by the existing all-rows-superseded rule. Closure
+// becomes visible to a boundary record in one of two ways: (1) a later
+// generation for the *same* partial key already exists at or before the
+// boundary — record()'s own open-sequence check proves the earlier
+// generation was already closed before that later generation could start, so
+// this needs no timestamp at all; or (2), for a closed generation with no
+// such later same-key generation (a cross-key boundary record, the case
+// resetAction leaves no append-position marker for), the boundary record's
+// recorded_at is compared against the generation's supersededAt with a
+// non-strict >=. record() requires every new record's recorded_at to be at
+// least the ledger's updated_at, which a preceding resetAction already
+// raised to its own observed_at — so a tie can only mean the boundary record
+// was read after the reset committed; ties are therefore resolved as
+// visible/closed, matching what a fresh present-position read (below)
+// always shows regardless of timestamps. See currentGenerationRows and
+// resolveKey.
+export function distributionHistoryDecisions(decisions, beforeIndex = decisions.length) {
+  const preceding = decisions.slice(0, beforeIndex);
+  const atPresentPosition = beforeIndex === decisions.length;
+  const boundaryRecord = atPresentPosition ? null : decisions[beforeIndex];
+  // Include the row at the replay boundary only to observe a new generation's
+  // step 0; it never becomes part of its own preceding distribution history.
+  const boundaryRows = decisions.slice(
+    0,
+    Math.min(decisions.length, beforeIndex + (atPresentPosition ? 0 : 1)),
   );
-  const kept = new Set();
+  const partialKeys = new Set(
+    boundaryRows.map((record) =>
+      JSON.stringify([record.key.task, record.key.role, record.key.attempt]),
+    ),
+  );
+  const closed = new Set();
   for (const partialKey of partialKeys) {
     const [task, role, attempt] = JSON.parse(partialKey);
-    const rows = currentGenerationRows(decisions, task, role, attempt);
-    if (rows.length === 0 || rows.every((row) => row.status === "superseded")) {
-      continue;
-    }
+    const rows = boundaryRows.filter(
+      (record) =>
+        record.key.task === task && record.key.role === role && record.key.attempt === attempt,
+    );
+    const generations = [];
     for (const row of rows) {
-      kept.add(row);
+      if (row.step === 0) {
+        generations.push([]);
+      }
+      generations.at(-1)?.push(row);
+    }
+    for (let index = 0; index < generations.length; index += 1) {
+      const generation = generations[index];
+      const supersededAt = generation.reduce(
+        (latest, row) => (row.observed_at > latest ? row.observed_at : latest),
+        generation[0].observed_at,
+      );
+      const closureIsVisible =
+        atPresentPosition ||
+        index < generations.length - 1 ||
+        boundaryRecord.recorded_at >= supersededAt;
+      if (closureIsVisible && generation.every((row) => row.status === "superseded")) {
+        for (const row of generation) {
+          closed.add(row);
+        }
+      }
     }
   }
-  return decisions.filter((record) => kept.has(record));
+  return preceding.filter((record) => !closed.has(record));
 }
 
+// The current-generation projection is the present-position application of
+// the append-position generation history invariant. Keeping it derived from
+// the shared helper prevents policy history and ledger replay from acquiring
+// separate generation filters again.
+export function currentGenerationDecisions(decisions) {
+  return distributionHistoryDecisions(decisions);
+}
+
+// Resolves the row a caller's key/step addresses, scoped to the partial
+// key's current decision sequence (see currentGenerationRows). Without this
+// scoping, a same-policy resetAction leaves a closed generation's row with
+// the exact same (task, role, attempt, policy_revision, step) as the fresh
+// generation that replaces it, and an unscoped array scan would resolve to
+// whichever of the two rows was appended first -- the stale, superseded one
+// -- for every later appendEvent/updateOutcome/attachOverride call against
+// the fresh row, not just the initial record() lookup.
 function findRecordIndex(decisions, key, step) {
-  return decisions.findIndex(
-    (record) =>
-      record.key.task === key.task &&
-      record.key.role === key.role &&
-      record.key.attempt === key.attempt &&
-      record.key.policy_revision === key.policy_revision &&
-      record.step === step,
+  const generationRows = currentGenerationRows(decisions, key.task, key.role, key.attempt);
+  const match = generationRows.find(
+    (record) => record.key.policy_revision === key.policy_revision && record.step === step,
   );
+  return match === undefined ? -1 : decisions.indexOf(match);
 }
 
 export class RoutingDecisionLedger {
@@ -1368,22 +1427,17 @@ export class RoutingDecisionLedger {
     if (record.status !== "selected") {
       throw new RoutingLedgerError("An initial routing decision must be recorded as selected");
     }
-    const existingIndex = findRecordIndex(snapshot.decisions, record.key, record.step);
-    if (existingIndex !== -1) {
-      const existing = snapshot.decisions[existingIndex];
-      if (stableStringify(existing) === stableStringify(record)) {
-        return snapshot;
-      }
-      throw new RoutingLedgerError(
-        `Refusing to rewrite recorded decision ${decisionKeyString(record.key)} step ${record.step}`,
-      );
-    }
     // A row only ever joins the partial key's current, still-open decision
     // sequence (see currentGenerationRows). Once a route reset has
     // superseded every row of that sequence, it is closed: the next record
     // for the same partial key must start an unrelated sequence at step 0,
     // free of the old sequence's policy revision, exactly as if the action
-    // had never run before.
+    // had never run before. The exact-match "existing row" lookup below is
+    // therefore restricted to an open sequence: a closed generation's row is
+    // never eligible to stand in as the "existing" row for a fresh
+    // generation's record, even when the fresh record's policy_revision
+    // equals the closed generation's -- the same-policy reset case, where
+    // resetAction never required or forced a policy-revision change.
     const generationRows = currentGenerationRows(
       snapshot.decisions,
       record.key.task,
@@ -1392,6 +1446,20 @@ export class RoutingDecisionLedger {
     );
     const openSequence =
       generationRows.length > 0 && generationRows.some((entry) => entry.status !== "superseded");
+    const existing = openSequence
+      ? generationRows.find(
+          (entry) =>
+            entry.key.policy_revision === record.key.policy_revision && entry.step === record.step,
+        )
+      : undefined;
+    if (existing !== undefined) {
+      if (stableStringify(existing) === stableStringify(record)) {
+        return snapshot;
+      }
+      throw new RoutingLedgerError(
+        `Refusing to rewrite recorded decision ${decisionKeyString(record.key)} step ${record.step}`,
+      );
+    }
     if (openSequence) {
       if (generationRows.some((entry) => entry.key.policy_revision !== record.key.policy_revision)) {
         throw new RoutingLedgerError(
